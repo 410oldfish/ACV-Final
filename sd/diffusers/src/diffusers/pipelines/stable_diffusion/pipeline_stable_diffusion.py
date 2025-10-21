@@ -1,0 +1,1761 @@
+# Copyright 2024 The HuggingFace Team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import time, json, os, math
+import inspect
+from typing import Any, Callable, Dict, List, Optional, Union
+import copy
+from dataclasses import dataclass, field
+from sd.scorers import CLIPScorer
+import torch
+from packaging import version
+from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection
+import math
+from collections import defaultdict
+import numpy as np
+from tqdm import tqdm
+
+from ...callbacks import MultiPipelineCallbacks, PipelineCallback
+from ...configuration_utils import FrozenDict
+from ...image_processor import PipelineImageInput, VaeImageProcessor
+from ...loaders import FromSingleFileMixin, IPAdapterMixin, StableDiffusionLoraLoaderMixin, TextualInversionLoaderMixin
+from ...models import AutoencoderKL, ImageProjection, UNet2DConditionModel
+from ...models.lora import adjust_lora_scale_text_encoder
+from ...schedulers import KarrasDiffusionSchedulers
+from ...utils import (
+    USE_PEFT_BACKEND,
+    deprecate,
+    is_torch_xla_available,
+    logging,
+    replace_example_docstring,
+    scale_lora_layers,
+    unscale_lora_layers,
+)
+from ...utils.torch_utils import randn_tensor
+from ..pipeline_utils import DiffusionPipeline, StableDiffusionMixin
+from .pipeline_output import StableDiffusionPipelineOutput
+from .safety_checker import StableDiffusionSafetyChecker
+
+if is_torch_xla_available():
+    import torch_xla.core.xla_model as xm
+
+    XLA_AVAILABLE = True
+else:
+    XLA_AVAILABLE = False
+
+logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+EXAMPLE_DOC_STRING = """
+    Examples:
+        ```py
+        >>> import torch
+        >>> from diffusers import StableDiffusionPipeline
+
+        >>> pipe = StableDiffusionPipeline.from_pretrained(
+        ...     "stable-diffusion-v1-5/stable-diffusion-v1-5", torch_dtype=torch.float16
+        ... )
+        >>> pipe = pipe.to("cuda")
+
+        >>> prompt = "a photo of an astronaut riding a horse on mars"
+        >>> image = pipe(prompt).images[0]
+        ```
+"""
+
+import torch, torch.nn.functional as F
+
+def _sync_cuda():
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+    except Exception:
+        pass
+
+
+def _vae_decode_to_image(latents, pipe):
+    # latents: (B,4,H,W) → (B,3,H*8,W*8) ∈ [0,1]
+    latents = latents / pipe.vae.config.scaling_factor
+    with torch.no_grad():
+        imgs = pipe.vae.decode(latents).sample  # [-1,1]
+    imgs = (imgs.clamp(-1, 1) + 1) / 2.0
+    return imgs
+
+def _score_image_lowres(img, scorer_fn, prompt: str, downscale_factor=4):
+    # img: (1,3,H,W) in [0,1]
+    if downscale_factor and downscale_factor > 1:
+        h, w = img.shape[-2:]
+        img = F.interpolate(
+            img,
+            size=(max(1, h // downscale_factor), max(1, w // downscale_factor)),
+            mode='area',
+            align_corners=None
+        )
+    # 与项目内原有的 score_function 接口保持一致（images=[uint8], prompts=[str]）
+    img_uint8 = (img * 127.5 + 128).clamp(0, 255).to(torch.uint8)
+    return scorer_fn(images=[img_uint8], prompts=[prompt], timesteps=None)
+
+def _rollout_score_candidate(
+    latent_start,
+    start_index,
+    pipe, timesteps,
+    scorer_fn, prompt,
+    r=1, gap=3, downscale_factor=2,
+    prompt_embeds=None, timestep_cond=None, added_cond_kwargs=None,
+    extra_step_kwargs=None,
+):
+    if extra_step_kwargs is None:
+        extra_step_kwargs = {}
+
+    # 兼容 cross_attention_kwargs 的不同命名
+    cross_kwargs = getattr(pipe, "_cross_attention_kwargs", None)
+    if cross_kwargs is None:
+        cross_kwargs = getattr(pipe, "cross_attention_kwargs", None)
+
+    def one_step(lat, idx_t):
+        t = timesteps[idx_t]
+        latent_model_input = torch.cat([lat] * 2) if pipe.do_classifier_free_guidance else lat
+        latent_model_input = pipe.scheduler.scale_model_input(latent_model_input, t)
+        noise_pred = pipe.unet(
+            latent_model_input,
+            t,
+            encoder_hidden_states=prompt_embeds,
+            timestep_cond=timestep_cond,
+            cross_attention_kwargs=cross_kwargs,
+            added_cond_kwargs=added_cond_kwargs,
+            return_dict=False,
+        )[0]
+        if pipe.do_classifier_free_guidance:
+            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+            noise_pred = noise_pred_uncond + pipe.guidance_scale * (noise_pred_text - noise_pred_uncond)
+        if pipe.do_classifier_free_guidance and getattr(pipe, "guidance_rescale", 0.0) > 0.0:
+            from diffusers.utils.torch_utils import rescale_noise_cfg
+            noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=pipe.guidance_rescale)
+
+        # ！！！注意这里：同时拿 prev_sample（下一时刻 latent）和 pred_original_sample（x0 估计）
+        lat_next, pred_x0 = pipe.scheduler.step(
+            noise_pred, t, lat, **extra_step_kwargs, return_dict=False
+        )
+        return lat_next, pred_x0
+
+    with torch.inference_mode():
+        lat = latent_start
+        idx = start_index
+        pred_x0_last = None
+        max_hops = max(0, min(r, (len(timesteps) - start_index + gap - 1)//gap))
+        for _ in range(max_hops):
+            if idx >= len(timesteps):
+                break
+            lat, pred_x0_last = one_step(lat, idx)
+            idx += gap
+
+        # 用“最后一次 step 的 x0 估计”来解码打分（与 baseline 一致）
+        # pred_x0_last 可能为 None（比如 r=0），就回退到当前 lat 的 x0 估计（极端兜底）
+        to_decode = pred_x0_last if pred_x0_last is not None else lat
+        imgs = pipe.vae.decode((to_decode / pipe.vae.config.scaling_factor)).sample  # [-1,1]
+        imgs = (imgs.clamp(-1, 1) + 1) / 2.0
+
+        # 低分辨率仅用于非 CLIP（你已在外层做了 clip 特判的话，这里就照传入的 downscale_factor）
+        if downscale_factor and downscale_factor > 1:
+            h, w = imgs.shape[-2:]
+            imgs = F.interpolate(
+                imgs, size=(max(1, h // downscale_factor), max(1, w // downscale_factor)),
+                mode="area", align_corners=None
+            )
+
+        img_uint8 = (imgs * 127.5 + 128).clamp(0, 255).to(torch.uint8)
+        score = scorer_fn(images=[img_uint8], prompts=[prompt], timesteps=None)
+        return score.item() if torch.is_tensor(score) else float(score)
+
+
+def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
+    r"""
+    Rescales `noise_cfg` tensor based on `guidance_rescale` to improve image quality and fix overexposure. Based on
+    Section 3.4 from [Common Diffusion Noise Schedules and Sample Steps are
+    Flawed](https://arxiv.org/pdf/2305.08891.pdf).
+
+    Args:
+        noise_cfg (`torch.Tensor`):
+            The predicted noise tensor for the guided diffusion process.
+        noise_pred_text (`torch.Tensor`):
+            The predicted noise tensor for the text-guided diffusion process.
+        guidance_rescale (`float`, *optional*, defaults to 0.0):
+            A rescale factor applied to the noise predictions.
+
+    Returns:
+        noise_cfg (`torch.Tensor`): The rescaled noise prediction tensor.
+    """
+    std_text = noise_pred_text.std(dim=list(range(1, noise_pred_text.ndim)), keepdim=True)
+    std_cfg = noise_cfg.std(dim=list(range(1, noise_cfg.ndim)), keepdim=True)
+    # rescale the results from guidance (fixes overexposure)
+    noise_pred_rescaled = noise_cfg * (std_text / std_cfg)
+    # mix with the original results from guidance by factor guidance_rescale to avoid "plain looking" images
+    noise_cfg = guidance_rescale * noise_pred_rescaled + (1 - guidance_rescale) * noise_cfg
+    return noise_cfg
+
+
+def retrieve_timesteps(
+    scheduler,
+    num_inference_steps: Optional[int] = None,
+    device: Optional[Union[str, torch.device]] = None,
+    timesteps: Optional[List[int]] = None,
+    sigmas: Optional[List[float]] = None,
+    **kwargs,
+):
+    r"""
+    Calls the scheduler's `set_timesteps` method and retrieves timesteps from the scheduler after the call. Handles
+    custom timesteps. Any kwargs will be supplied to `scheduler.set_timesteps`.
+
+    Args:
+        scheduler (`SchedulerMixin`):
+            The scheduler to get timesteps from.
+        num_inference_steps (`int`):
+            The number of diffusion steps used when generating samples with a pre-trained model. If used, `timesteps`
+            must be `None`.
+        device (`str` or `torch.device`, *optional*):
+            The device to which the timesteps should be moved to. If `None`, the timesteps are not moved.
+        timesteps (`List[int]`, *optional*):
+            Custom timesteps used to override the timestep spacing strategy of the scheduler. If `timesteps` is passed,
+            `num_inference_steps` and `sigmas` must be `None`.
+        sigmas (`List[float]`, *optional*):
+            Custom sigmas used to override the timestep spacing strategy of the scheduler. If `sigmas` is passed,
+            `num_inference_steps` and `timesteps` must be `None`.
+
+    Returns:
+        `Tuple[torch.Tensor, int]`: A tuple where the first element is the timestep schedule from the scheduler and the
+        second element is the number of inference steps.
+    """
+    if timesteps is not None and sigmas is not None:
+        raise ValueError("Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values")
+    if timesteps is not None:
+        accepts_timesteps = "timesteps" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+        if not accepts_timesteps:
+            raise ValueError(
+                f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
+                f" timestep schedules. Please check whether you are using the correct scheduler."
+            )
+        scheduler.set_timesteps(timesteps=timesteps, device=device, **kwargs)
+        timesteps = scheduler.timesteps
+        num_inference_steps = len(timesteps)
+    elif sigmas is not None:
+        accept_sigmas = "sigmas" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+        if not accept_sigmas:
+            raise ValueError(
+                f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
+                f" sigmas schedules. Please check whether you are using the correct scheduler."
+            )
+        scheduler.set_timesteps(sigmas=sigmas, device=device, **kwargs)
+        timesteps = scheduler.timesteps
+        num_inference_steps = len(timesteps)
+    else:
+        scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
+        timesteps = scheduler.timesteps
+    return timesteps, num_inference_steps
+
+class StableDiffusionPipeline(
+    DiffusionPipeline,
+    StableDiffusionMixin,
+    TextualInversionLoaderMixin,
+    StableDiffusionLoraLoaderMixin,
+    IPAdapterMixin,
+    FromSingleFileMixin,
+):
+    """
+    Pipeline for text-to-image generation using Stable Diffusion.
+
+    This model inherits from [`DiffusionPipeline`]. Check the superclass documentation for the generic methods
+    implemented for all pipelines (downloading, saving, running on a particular device, etc.).
+
+    The pipeline also inherits the following loading methods:
+        - [`~loaders.TextualInversionLoaderMixin.load_textual_inversion`] for loading textual inversion embeddings
+        - [`~loaders.StableDiffusionLoraLoaderMixin.load_lora_weights`] for loading LoRA weights
+        - [`~loaders.StableDiffusionLoraLoaderMixin.save_lora_weights`] for saving LoRA weights
+        - [`~loaders.FromSingleFileMixin.from_single_file`] for loading `.ckpt` files
+        - [`~loaders.IPAdapterMixin.load_ip_adapter`] for loading IP Adapters
+
+    Args:
+        vae ([`AutoencoderKL`]):
+            Variational Auto-Encoder (VAE) model to encode and decode images to and from latent representations.
+        text_encoder ([`~transformers.CLIPTextModel`]):
+            Frozen text-encoder ([clip-vit-large-patch14](https://huggingface.co/openai/clip-vit-large-patch14)).
+        tokenizer ([`~transformers.CLIPTokenizer`]):
+            A `CLIPTokenizer` to tokenize text.
+        unet ([`UNet2DConditionModel`]):
+            A `UNet2DConditionModel` to denoise the encoded image latents.
+        scheduler ([`SchedulerMixin`]):
+            A scheduler to be used in combination with `unet` to denoise the encoded image latents. Can be one of
+            [`DDIMScheduler`], [`LMSDiscreteScheduler`], or [`PNDMScheduler`].
+        safety_checker ([`StableDiffusionSafetyChecker`]):
+            Classification module that estimates whether generated images could be considered offensive or harmful.
+            Please refer to the [model card](https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5) for
+            more details about a model's potential harms.
+        feature_extractor ([`~transformers.CLIPImageProcessor`]):
+            A `CLIPImageProcessor` to extract features from generated images; used as inputs to the `safety_checker`.
+    """
+
+    model_cpu_offload_seq = "text_encoder->image_encoder->unet->vae"
+    _optional_components = ["safety_checker", "feature_extractor", "image_encoder"]
+    _exclude_from_cpu_offload = ["safety_checker"]
+    _callback_tensor_inputs = ["latents", "prompt_embeds", "negative_prompt_embeds"]
+
+    def __init__(
+        self,
+        vae: AutoencoderKL,
+        text_encoder: CLIPTextModel,
+        tokenizer: CLIPTokenizer,
+        unet: UNet2DConditionModel,
+        scheduler: KarrasDiffusionSchedulers,
+        safety_checker: StableDiffusionSafetyChecker,
+        feature_extractor: CLIPImageProcessor,
+        image_encoder: CLIPVisionModelWithProjection = None,
+        requires_safety_checker: bool = True,
+    ):
+        super().__init__()
+
+        if scheduler is not None and getattr(scheduler.config, "steps_offset", 1) != 1:
+            deprecation_message = (
+                f"The configuration file of this scheduler: {scheduler} is outdated. `steps_offset`"
+                f" should be set to 1 instead of {scheduler.config.steps_offset}. Please make sure "
+                "to update the config accordingly as leaving `steps_offset` might led to incorrect results"
+                " in future versions. If you have downloaded this checkpoint from the Hugging Face Hub,"
+                " it would be very nice if you could open a Pull request for the `scheduler/scheduler_config.json`"
+                " file"
+            )
+            deprecate("steps_offset!=1", "1.0.0", deprecation_message, standard_warn=False)
+            new_config = dict(scheduler.config)
+            new_config["steps_offset"] = 1
+            scheduler._internal_dict = FrozenDict(new_config)
+
+        if scheduler is not None and getattr(scheduler.config, "clip_sample", False) is True:
+            deprecation_message = (
+                f"The configuration file of this scheduler: {scheduler} has not set the configuration `clip_sample`."
+                " `clip_sample` should be set to False in the configuration file. Please make sure to update the"
+                " config accordingly as not setting `clip_sample` in the config might lead to incorrect results in"
+                " future versions. If you have downloaded this checkpoint from the Hugging Face Hub, it would be very"
+                " nice if you could open a Pull request for the `scheduler/scheduler_config.json` file"
+            )
+            deprecate("clip_sample not set", "1.0.0", deprecation_message, standard_warn=False)
+            new_config = dict(scheduler.config)
+            new_config["clip_sample"] = False
+            scheduler._internal_dict = FrozenDict(new_config)
+
+        if safety_checker is None and requires_safety_checker:
+            logger.warning(
+                f"You have disabled the safety checker for {self.__class__} by passing `safety_checker=None`. Ensure"
+                " that you abide to the conditions of the Stable Diffusion license and do not expose unfiltered"
+                " results in services or applications open to the public. Both the diffusers team and Hugging Face"
+                " strongly recommend to keep the safety filter enabled in all public facing circumstances, disabling"
+                " it only for use-cases that involve analyzing network behavior or auditing its results. For more"
+                " information, please have a look at https://github.com/huggingface/diffusers/pull/254 ."
+            )
+
+        if safety_checker is not None and feature_extractor is None:
+            raise ValueError(
+                "Make sure to define a feature extractor when loading {self.__class__} if you want to use the safety"
+                " checker. If you do not want to use the safety checker, you can pass `'safety_checker=None'` instead."
+            )
+
+        is_unet_version_less_0_9_0 = (
+            unet is not None
+            and hasattr(unet.config, "_diffusers_version")
+            and version.parse(version.parse(unet.config._diffusers_version).base_version) < version.parse("0.9.0.dev0")
+        )
+        self._is_unet_config_sample_size_int = unet is not None and isinstance(unet.config.sample_size, int)
+        is_unet_sample_size_less_64 = (
+            unet is not None
+            and hasattr(unet.config, "sample_size")
+            and self._is_unet_config_sample_size_int
+            and unet.config.sample_size < 64
+        )
+        if is_unet_version_less_0_9_0 and is_unet_sample_size_less_64:
+            deprecation_message = (
+                "The configuration file of the unet has set the default `sample_size` to smaller than"
+                " 64 which seems highly unlikely. If your checkpoint is a fine-tuned version of any of the"
+                " following: \n- CompVis/stable-diffusion-v1-4 \n- CompVis/stable-diffusion-v1-3 \n-"
+                " CompVis/stable-diffusion-v1-2 \n- CompVis/stable-diffusion-v1-1 \n- stable-diffusion-v1-5/stable-diffusion-v1-5"
+                " \n- stable-diffusion-v1-5/stable-diffusion-inpainting \n you should change 'sample_size' to 64 in the"
+                " configuration file. Please make sure to update the config accordingly as leaving `sample_size=32`"
+                " in the config might lead to incorrect results in future versions. If you have downloaded this"
+                " checkpoint from the Hugging Face Hub, it would be very nice if you could open a Pull request for"
+                " the `unet/config.json` file"
+            )
+            deprecate("sample_size<64", "1.0.0", deprecation_message, standard_warn=False)
+            new_config = dict(unet.config)
+            new_config["sample_size"] = 64
+            unet._internal_dict = FrozenDict(new_config)
+
+        self.register_modules(
+            vae=vae,
+            text_encoder=text_encoder,
+            tokenizer=tokenizer,
+            unet=unet,
+            scheduler=scheduler,
+            safety_checker=safety_checker,
+            feature_extractor=feature_extractor,
+            image_encoder=image_encoder,
+        )
+        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
+        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
+        self.register_to_config(requires_safety_checker=requires_safety_checker)
+
+    def _encode_prompt(
+        self,
+        prompt,
+        device,
+        num_images_per_prompt,
+        do_classifier_free_guidance,
+        negative_prompt=None,
+        prompt_embeds: Optional[torch.Tensor] = None,
+        negative_prompt_embeds: Optional[torch.Tensor] = None,
+        lora_scale: Optional[float] = None,
+        **kwargs,
+    ):
+        deprecation_message = "`_encode_prompt()` is deprecated and it will be removed in a future version. Use `encode_prompt()` instead. Also, be aware that the output format changed from a concatenated tensor to a tuple."
+        deprecate("_encode_prompt()", "1.0.0", deprecation_message, standard_warn=False)
+
+        prompt_embeds_tuple = self.encode_prompt(
+            prompt=prompt,
+            device=device,
+            num_images_per_prompt=num_images_per_prompt,
+            do_classifier_free_guidance=do_classifier_free_guidance,
+            negative_prompt=negative_prompt,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            lora_scale=lora_scale,
+            **kwargs,
+        )
+
+        # concatenate for backwards comp
+        prompt_embeds = torch.cat([prompt_embeds_tuple[1], prompt_embeds_tuple[0]])
+
+        return prompt_embeds
+
+    def encode_prompt(
+        self,
+        prompt,
+        device,
+        num_images_per_prompt,
+        do_classifier_free_guidance,
+        negative_prompt=None,
+        prompt_embeds: Optional[torch.Tensor] = None,
+        negative_prompt_embeds: Optional[torch.Tensor] = None,
+        lora_scale: Optional[float] = None,
+        clip_skip: Optional[int] = None,
+    ):
+        r"""
+        Encodes the prompt into text encoder hidden states.
+
+        Args:
+            prompt (`str` or `List[str]`, *optional*):
+                prompt to be encoded
+            device: (`torch.device`):
+                torch device
+            num_images_per_prompt (`int`):
+                number of images that should be generated per prompt
+            do_classifier_free_guidance (`bool`):
+                whether to use classifier free guidance or not
+            negative_prompt (`str` or `List[str]`, *optional*):
+                The prompt or prompts not to guide the image generation. If not defined, one has to pass
+                `negative_prompt_embeds` instead. Ignored when not using guidance (i.e., ignored if `guidance_scale` is
+                less than `1`).
+            prompt_embeds (`torch.Tensor`, *optional*):
+                Pre-generated text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting. If not
+                provided, text embeddings will be generated from `prompt` input argument.
+            negative_prompt_embeds (`torch.Tensor`, *optional*):
+                Pre-generated negative text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt
+                weighting. If not provided, negative_prompt_embeds will be generated from `negative_prompt` input
+                argument.
+            lora_scale (`float`, *optional*):
+                A LoRA scale that will be applied to all LoRA layers of the text encoder if LoRA layers are loaded.
+            clip_skip (`int`, *optional*):
+                Number of layers to be skipped from CLIP while computing the prompt embeddings. A value of 1 means that
+                the output of the pre-final layer will be used for computing the prompt embeddings.
+        """
+        # set lora scale so that monkey patched LoRA
+        # function of text encoder can correctly access it
+        if lora_scale is not None and isinstance(self, StableDiffusionLoraLoaderMixin):
+            self._lora_scale = lora_scale
+
+            # dynamically adjust the LoRA scale
+            if not USE_PEFT_BACKEND:
+                adjust_lora_scale_text_encoder(self.text_encoder, lora_scale)
+            else:
+                scale_lora_layers(self.text_encoder, lora_scale)
+
+        if prompt is not None and isinstance(prompt, str):
+            batch_size = 1
+        elif prompt is not None and isinstance(prompt, list):
+            batch_size = len(prompt)
+        else:
+            batch_size = prompt_embeds.shape[0]
+
+        if prompt_embeds is None:
+            # textual inversion: process multi-vector tokens if necessary
+            if isinstance(self, TextualInversionLoaderMixin):
+                prompt = self.maybe_convert_prompt(prompt, self.tokenizer)
+
+            text_inputs = self.tokenizer(
+                prompt,
+                padding="max_length",
+                max_length=self.tokenizer.model_max_length,
+                truncation=True,
+                return_tensors="pt",
+            )
+            text_input_ids = text_inputs.input_ids
+            untruncated_ids = self.tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
+
+            if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(
+                text_input_ids, untruncated_ids
+            ):
+                removed_text = self.tokenizer.batch_decode(
+                    untruncated_ids[:, self.tokenizer.model_max_length - 1 : -1]
+                )
+                logger.warning(
+                    "The following part of your input was truncated because CLIP can only handle sequences up to"
+                    f" {self.tokenizer.model_max_length} tokens: {removed_text}"
+                )
+
+            if hasattr(self.text_encoder.config, "use_attention_mask") and self.text_encoder.config.use_attention_mask:
+                attention_mask = text_inputs.attention_mask.to(device)
+            else:
+                attention_mask = None
+
+            if clip_skip is None:
+                prompt_embeds = self.text_encoder(text_input_ids.to(device), attention_mask=attention_mask)
+                prompt_embeds = prompt_embeds[0]
+            else:
+                prompt_embeds = self.text_encoder(
+                    text_input_ids.to(device), attention_mask=attention_mask, output_hidden_states=True
+                )
+                # Access the `hidden_states` first, that contains a tuple of
+                # all the hidden states from the encoder layers. Then index into
+                # the tuple to access the hidden states from the desired layer.
+                prompt_embeds = prompt_embeds[-1][-(clip_skip + 1)]
+                # We also need to apply the final LayerNorm here to not mess with the
+                # representations. The `last_hidden_states` that we typically use for
+                # obtaining the final prompt representations passes through the LayerNorm
+                # layer.
+                prompt_embeds = self.text_encoder.text_model.final_layer_norm(prompt_embeds)
+
+        if self.text_encoder is not None:
+            prompt_embeds_dtype = self.text_encoder.dtype
+        elif self.unet is not None:
+            prompt_embeds_dtype = self.unet.dtype
+        else:
+            prompt_embeds_dtype = prompt_embeds.dtype
+
+        prompt_embeds = prompt_embeds.to(dtype=prompt_embeds_dtype, device=device)
+
+        bs_embed, seq_len, _ = prompt_embeds.shape
+        # duplicate text embeddings for each generation per prompt, using mps friendly method
+        prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
+        prompt_embeds = prompt_embeds.view(bs_embed * num_images_per_prompt, seq_len, -1)
+
+        # get unconditional embeddings for classifier free guidance
+        if do_classifier_free_guidance and negative_prompt_embeds is None:
+            uncond_tokens: List[str]
+            if negative_prompt is None:
+                uncond_tokens = [""] * batch_size
+            elif prompt is not None and type(prompt) is not type(negative_prompt):
+                raise TypeError(
+                    f"`negative_prompt` should be the same type to `prompt`, but got {type(negative_prompt)} !="
+                    f" {type(prompt)}."
+                )
+            elif isinstance(negative_prompt, str):
+                uncond_tokens = [negative_prompt]
+            elif batch_size != len(negative_prompt):
+                raise ValueError(
+                    f"`negative_prompt`: {negative_prompt} has batch size {len(negative_prompt)}, but `prompt`:"
+                    f" {prompt} has batch size {batch_size}. Please make sure that passed `negative_prompt` matches"
+                    " the batch size of `prompt`."
+                )
+            else:
+                uncond_tokens = negative_prompt
+
+            # textual inversion: process multi-vector tokens if necessary
+            if isinstance(self, TextualInversionLoaderMixin):
+                uncond_tokens = self.maybe_convert_prompt(uncond_tokens, self.tokenizer)
+
+            max_length = prompt_embeds.shape[1]
+            uncond_input = self.tokenizer(
+                uncond_tokens,
+                padding="max_length",
+                max_length=max_length,
+                truncation=True,
+                return_tensors="pt",
+            )
+
+            if hasattr(self.text_encoder.config, "use_attention_mask") and self.text_encoder.config.use_attention_mask:
+                attention_mask = uncond_input.attention_mask.to(device)
+            else:
+                attention_mask = None
+
+            negative_prompt_embeds = self.text_encoder(
+                uncond_input.input_ids.to(device),
+                attention_mask=attention_mask,
+            )
+            negative_prompt_embeds = negative_prompt_embeds[0]
+
+        if do_classifier_free_guidance:
+            # duplicate unconditional embeddings for each generation per prompt, using mps friendly method
+            seq_len = negative_prompt_embeds.shape[1]
+
+            negative_prompt_embeds = negative_prompt_embeds.to(dtype=prompt_embeds_dtype, device=device)
+
+            negative_prompt_embeds = negative_prompt_embeds.repeat(1, num_images_per_prompt, 1)
+            negative_prompt_embeds = negative_prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
+
+        if self.text_encoder is not None:
+            if isinstance(self, StableDiffusionLoraLoaderMixin) and USE_PEFT_BACKEND:
+                # Retrieve the original scale by scaling back the LoRA layers
+                unscale_lora_layers(self.text_encoder, lora_scale)
+
+        return prompt_embeds, negative_prompt_embeds
+
+    def encode_image(self, image, device, num_images_per_prompt, output_hidden_states=None):
+        dtype = next(self.image_encoder.parameters()).dtype
+
+        if not isinstance(image, torch.Tensor):
+            image = self.feature_extractor(image, return_tensors="pt").pixel_values
+
+        image = image.to(device=device, dtype=dtype)
+        if output_hidden_states:
+            image_enc_hidden_states = self.image_encoder(image, output_hidden_states=True).hidden_states[-2]
+            image_enc_hidden_states = image_enc_hidden_states.repeat_interleave(num_images_per_prompt, dim=0)
+            uncond_image_enc_hidden_states = self.image_encoder(
+                torch.zeros_like(image), output_hidden_states=True
+            ).hidden_states[-2]
+            uncond_image_enc_hidden_states = uncond_image_enc_hidden_states.repeat_interleave(
+                num_images_per_prompt, dim=0
+            )
+            return image_enc_hidden_states, uncond_image_enc_hidden_states
+        else:
+            image_embeds = self.image_encoder(image).image_embeds
+            image_embeds = image_embeds.repeat_interleave(num_images_per_prompt, dim=0)
+            uncond_image_embeds = torch.zeros_like(image_embeds)
+
+            return image_embeds, uncond_image_embeds
+
+    def prepare_ip_adapter_image_embeds(
+        self, ip_adapter_image, ip_adapter_image_embeds, device, num_images_per_prompt, do_classifier_free_guidance
+    ):
+        image_embeds = []
+        if do_classifier_free_guidance:
+            negative_image_embeds = []
+        if ip_adapter_image_embeds is None:
+            if not isinstance(ip_adapter_image, list):
+                ip_adapter_image = [ip_adapter_image]
+
+            if len(ip_adapter_image) != len(self.unet.encoder_hid_proj.image_projection_layers):
+                raise ValueError(
+                    f"`ip_adapter_image` must have same length as the number of IP Adapters. Got {len(ip_adapter_image)} images and {len(self.unet.encoder_hid_proj.image_projection_layers)} IP Adapters."
+                )
+
+            for single_ip_adapter_image, image_proj_layer in zip(
+                ip_adapter_image, self.unet.encoder_hid_proj.image_projection_layers
+            ):
+                output_hidden_state = not isinstance(image_proj_layer, ImageProjection)
+                single_image_embeds, single_negative_image_embeds = self.encode_image(
+                    single_ip_adapter_image, device, 1, output_hidden_state
+                )
+
+                image_embeds.append(single_image_embeds[None, :])
+                if do_classifier_free_guidance:
+                    negative_image_embeds.append(single_negative_image_embeds[None, :])
+        else:
+            for single_image_embeds in ip_adapter_image_embeds:
+                if do_classifier_free_guidance:
+                    single_negative_image_embeds, single_image_embeds = single_image_embeds.chunk(2)
+                    negative_image_embeds.append(single_negative_image_embeds)
+                image_embeds.append(single_image_embeds)
+
+        ip_adapter_image_embeds = []
+        for i, single_image_embeds in enumerate(image_embeds):
+            single_image_embeds = torch.cat([single_image_embeds] * num_images_per_prompt, dim=0)
+            if do_classifier_free_guidance:
+                single_negative_image_embeds = torch.cat([negative_image_embeds[i]] * num_images_per_prompt, dim=0)
+                single_image_embeds = torch.cat([single_negative_image_embeds, single_image_embeds], dim=0)
+
+            single_image_embeds = single_image_embeds.to(device=device)
+            ip_adapter_image_embeds.append(single_image_embeds)
+
+        return ip_adapter_image_embeds
+
+    def run_safety_checker(self, image, device, dtype):
+        if self.safety_checker is None:
+            has_nsfw_concept = None
+        else:
+            if torch.is_tensor(image):
+                feature_extractor_input = self.image_processor.postprocess(image, output_type="pil")
+            else:
+                feature_extractor_input = self.image_processor.numpy_to_pil(image)
+            safety_checker_input = self.feature_extractor(feature_extractor_input, return_tensors="pt").to(device)
+            image, has_nsfw_concept = self.safety_checker(
+                images=image, clip_input=safety_checker_input.pixel_values.to(dtype)
+            )
+        return image, has_nsfw_concept
+
+    def decode_latents(self, latents):
+        deprecation_message = "The decode_latents method is deprecated and will be removed in 1.0.0. Please use VaeImageProcessor.postprocess(...) instead"
+        deprecate("decode_latents", "1.0.0", deprecation_message, standard_warn=False)
+
+        latents = 1 / self.vae.config.scaling_factor * latents
+        image = self.vae.decode(latents, return_dict=False)[0]
+        image = (image / 2 + 0.5).clamp(0, 1)
+        # we always cast to float32 as this does not cause significant overhead and is compatible with bfloat16
+        image = image.cpu().permute(0, 2, 3, 1).float().numpy()
+        return image
+
+    def prepare_extra_step_kwargs(self, generator, eta):
+        # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
+        # eta (η) is only used with the DDIMScheduler, it will be ignored for other schedulers.
+        # eta corresponds to η in DDIM paper: https://arxiv.org/abs/2010.02502
+        # and should be between [0, 1]
+
+        accepts_eta = "eta" in set(inspect.signature(self.scheduler.step).parameters.keys())
+        extra_step_kwargs = {}
+        if accepts_eta:
+            extra_step_kwargs["eta"] = eta
+
+        # check if the scheduler accepts generator
+        accepts_generator = "generator" in set(inspect.signature(self.scheduler.step).parameters.keys())
+        if accepts_generator:
+            extra_step_kwargs["generator"] = generator
+        return extra_step_kwargs
+
+    def check_inputs(
+        self,
+        prompt,
+        height,
+        width,
+        callback_steps,
+        negative_prompt=None,
+        prompt_embeds=None,
+        negative_prompt_embeds=None,
+        ip_adapter_image=None,
+        ip_adapter_image_embeds=None,
+        callback_on_step_end_tensor_inputs=None,
+    ):
+        if height % 8 != 0 or width % 8 != 0:
+            raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
+
+        if callback_steps is not None and (not isinstance(callback_steps, int) or callback_steps <= 0):
+            raise ValueError(
+                f"`callback_steps` has to be a positive integer but is {callback_steps} of type"
+                f" {type(callback_steps)}."
+            )
+        if callback_on_step_end_tensor_inputs is not None and not all(
+            k in self._callback_tensor_inputs for k in callback_on_step_end_tensor_inputs
+        ):
+            raise ValueError(
+                f"`callback_on_step_end_tensor_inputs` has to be in {self._callback_tensor_inputs}, but found {[k for k in callback_on_step_end_tensor_inputs if k not in self._callback_tensor_inputs]}"
+            )
+
+        if prompt is not None and prompt_embeds is not None:
+            raise ValueError(
+                f"Cannot forward both `prompt`: {prompt} and `prompt_embeds`: {prompt_embeds}. Please make sure to"
+                " only forward one of the two."
+            )
+        elif prompt is None and prompt_embeds is None:
+            raise ValueError(
+                "Provide either `prompt` or `prompt_embeds`. Cannot leave both `prompt` and `prompt_embeds` undefined."
+            )
+        elif prompt is not None and (not isinstance(prompt, str) and not isinstance(prompt, list)):
+            raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
+
+        if negative_prompt is not None and negative_prompt_embeds is not None:
+            raise ValueError(
+                f"Cannot forward both `negative_prompt`: {negative_prompt} and `negative_prompt_embeds`:"
+                f" {negative_prompt_embeds}. Please make sure to only forward one of the two."
+            )
+
+        if prompt_embeds is not None and negative_prompt_embeds is not None:
+            if prompt_embeds.shape != negative_prompt_embeds.shape:
+                raise ValueError(
+                    "`prompt_embeds` and `negative_prompt_embeds` must have the same shape when passed directly, but"
+                    f" got: `prompt_embeds` {prompt_embeds.shape} != `negative_prompt_embeds`"
+                    f" {negative_prompt_embeds.shape}."
+                )
+
+        if ip_adapter_image is not None and ip_adapter_image_embeds is not None:
+            raise ValueError(
+                "Provide either `ip_adapter_image` or `ip_adapter_image_embeds`. Cannot leave both `ip_adapter_image` and `ip_adapter_image_embeds` defined."
+            )
+
+        if ip_adapter_image_embeds is not None:
+            if not isinstance(ip_adapter_image_embeds, list):
+                raise ValueError(
+                    f"`ip_adapter_image_embeds` has to be of type `list` but is {type(ip_adapter_image_embeds)}"
+                )
+            elif ip_adapter_image_embeds[0].ndim not in [3, 4]:
+                raise ValueError(
+                    f"`ip_adapter_image_embeds` has to be a list of 3D or 4D tensors but is {ip_adapter_image_embeds[0].ndim}D"
+                )
+
+    def prepare_latents(self, batch_size, num_channels_latents, height, width, dtype, device, generator, latents=None):
+        shape = (
+            batch_size,
+            num_channels_latents,
+            int(height) // self.vae_scale_factor,
+            int(width) // self.vae_scale_factor,
+        )
+        if isinstance(generator, list) and len(generator) != batch_size:
+            raise ValueError(
+                f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
+                f" size of {batch_size}. Make sure the batch size matches the length of the generators."
+            )
+
+        if latents is None:
+            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        else:
+            latents = latents.to(device)
+
+        # scale the initial noise by the standard deviation required by the scheduler
+        latents = latents * self.scheduler.init_noise_sigma
+        return latents
+
+    # Copied from diffusers.pipelines.latent_consistency_models.pipeline_latent_consistency_text2img.LatentConsistencyModelPipeline.get_guidance_scale_embedding
+    def get_guidance_scale_embedding(
+        self, w: torch.Tensor, embedding_dim: int = 512, dtype: torch.dtype = torch.float32
+    ) -> torch.Tensor:
+        """
+        See https://github.com/google-research/vdm/blob/dc27b98a554f65cdc654b800da5aa1846545d41b/model_vdm.py#L298
+
+        Args:
+            w (`torch.Tensor`):
+                Generate embedding vectors with a specified guidance scale to subsequently enrich timestep embeddings.
+            embedding_dim (`int`, *optional*, defaults to 512):
+                Dimension of the embeddings to generate.
+            dtype (`torch.dtype`, *optional*, defaults to `torch.float32`):
+                Data type of the generated embeddings.
+
+        Returns:
+            `torch.Tensor`: Embedding vectors with shape `(len(w), embedding_dim)`.
+        """
+        assert len(w.shape) == 1
+        w = w * 1000.0
+
+        half_dim = embedding_dim // 2
+        emb = torch.log(torch.tensor(10000.0)) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, dtype=dtype) * -emb)
+        emb = w.to(dtype)[:, None] * emb[None, :]
+        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
+        if embedding_dim % 2 == 1:  # zero pad
+            emb = torch.nn.functional.pad(emb, (0, 1))
+        assert emb.shape == (w.shape[0], embedding_dim)
+        return emb
+
+    @property
+    def guidance_scale(self):
+        return self._guidance_scale
+
+    @property
+    def guidance_rescale(self):
+        return self._guidance_rescale
+
+    @property
+    def clip_skip(self):
+        return self._clip_skip
+
+    # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
+    # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
+    # corresponds to doing no classifier free guidance.
+    @property
+    def do_classifier_free_guidance(self):
+        return self._guidance_scale > 1 and self.unet.config.time_cond_proj_dim is None
+
+    @property
+    def cross_attention_kwargs(self):
+        return self._cross_attention_kwargs
+
+    @property
+    def num_timesteps(self):
+        return self._num_timesteps
+
+    @property
+    def interrupt(self):
+        return self._interrupt
+
+    @torch.no_grad()
+    @replace_example_docstring(EXAMPLE_DOC_STRING)
+    def __call__(
+        self,
+        prompt: Union[str, List[str]] = None,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+        num_inference_steps: int = 100,
+        timesteps: List[int] = None,
+        sigmas: List[float] = None,
+        guidance_scale: float = 7.5,
+        negative_prompt: Optional[Union[str, List[str]]] = None,
+        num_images_per_prompt: Optional[int] = 1,
+        eta: float = 1.0,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        latents: Optional[torch.Tensor] = None,
+        prompt_embeds: Optional[torch.Tensor] = None,
+        negative_prompt_embeds: Optional[torch.Tensor] = None,
+        ip_adapter_image: Optional[PipelineImageInput] = None,
+        ip_adapter_image_embeds: Optional[List[torch.Tensor]] = None,
+        output_type: Optional[str] = "pil",
+        return_dict: bool = True,
+        cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+        guidance_rescale: float = 0.0,
+        clip_skip: Optional[int] = None,
+        callback_on_step_end: Optional[
+            Union[Callable[[int, int, Dict], None], PipelineCallback, MultiPipelineCallbacks]
+        ] = None,
+        callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+        score_function: Optional[Callable] = None,
+        method: Optional[str] = "eps_greedy",
+        params: Optional[dict] = None,
+        **kwargs,
+    ):
+        r"""
+        The call function to the pipeline for generation.
+
+        Args:
+            prompt (`str` or `List[str]`, *optional*):
+                The prompt or prompts to guide image generation. If not defined, you need to pass `prompt_embeds`.
+            height (`int`, *optional*, defaults to `self.unet.config.sample_size * self.vae_scale_factor`):
+                The height in pixels of the generated image.
+            width (`int`, *optional*, defaults to `self.unet.config.sample_size * self.vae_scale_factor`):
+                The width in pixels of the generated image.
+            num_inference_steps (`int`, *optional*, defaults to 100):
+                The number of denoising steps. More denoising steps usually lead to a higher quality image at the
+                expense of slower inference.
+            timesteps (`List[int]`, *optional*):
+                Custom timesteps to use for the denoising process with schedulers which support a `timesteps` argument
+                in their `set_timesteps` method. If not defined, the default behavior when `num_inference_steps` is
+                passed will be used. Must be in descending order.
+            sigmas (`List[float]`, *optional*):
+                Custom sigmas to use for the denoising process with schedulers which support a `sigmas` argument in
+                their `set_timesteps` method. If not defined, the default behavior when `num_inference_steps` is passed
+                will be used.
+            guidance_scale (`float`, *optional*, defaults to 7.5):
+                A higher guidance scale value encourages the model to generate images closely linked to the text
+                `prompt` at the expense of lower image quality. Guidance scale is enabled when `guidance_scale > 1`.
+            negative_prompt (`str` or `List[str]`, *optional*):
+                The prompt or prompts to guide what to not include in image generation. If not defined, you need to
+                pass `negative_prompt_embeds` instead. Ignored when not using guidance (`guidance_scale < 1`).
+            num_images_per_prompt (`int`, *optional*, defaults to 1):
+                The number of images to generate per prompt.
+            eta (`float`, *optional*, defaults to 1.0):
+                Corresponds to parameter eta (η) from the [DDIM](https://arxiv.org/abs/2010.02502) paper. Only applies
+                to the [`~schedulers.DDIMScheduler`], and is ignored in other schedulers.
+            generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
+                A [`torch.Generator`](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make
+                generation deterministic.
+            latents (`torch.Tensor`, *optional*):
+                Pre-generated noisy latents sampled from a Gaussian distribution, to be used as inputs for image
+                generation. Can be used to tweak the same generation with different prompts. If not provided, a latents
+                tensor is generated by sampling using the supplied random `generator`.
+            prompt_embeds (`torch.Tensor`, *optional*):
+                Pre-generated text embeddings. Can be used to easily tweak text inputs (prompt weighting). If not
+                provided, text embeddings are generated from the `prompt` input argument.
+            negative_prompt_embeds (`torch.Tensor`, *optional*):
+                Pre-generated negative text embeddings. Can be used to easily tweak text inputs (prompt weighting). If
+                not provided, `negative_prompt_embeds` are generated from the `negative_prompt` input argument.
+            ip_adapter_image: (`PipelineImageInput`, *optional*): Optional image input to work with IP Adapters.
+            ip_adapter_image_embeds (`List[torch.Tensor]`, *optional*):
+                Pre-generated image embeddings for IP-Adapter. It should be a list of length same as number of
+                IP-adapters. Each element should be a tensor of shape `(batch_size, num_images, emb_dim)`. It should
+                contain the negative image embedding if `do_classifier_free_guidance` is set to `True`. If not
+                provided, embeddings are computed from the `ip_adapter_image` input argument.
+            output_type (`str`, *optional*, defaults to `"pil"`):
+                The output format of the generated image. Choose between `PIL.Image` or `np.array`.
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] instead of a
+                plain tuple.
+            cross_attention_kwargs (`dict`, *optional*):
+                A kwargs dictionary that if specified is passed along to the [`AttentionProcessor`] as defined in
+                [`self.processor`](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
+            guidance_rescale (`float`, *optional*, defaults to 0.0):
+                Guidance rescale factor from [Common Diffusion Noise Schedules and Sample Steps are
+                Flawed](https://arxiv.org/pdf/2305.08891.pdf). Guidance rescale factor should fix overexposure when
+                using zero terminal SNR.
+            clip_skip (`int`, *optional*):
+                Number of layers to be skipped from CLIP while computing the prompt embeddings. A value of 1 means that
+                the output of the pre-final layer will be used for computing the prompt embeddings.
+            callback_on_step_end (`Callable`, `PipelineCallback`, `MultiPipelineCallbacks`, *optional*):
+                A function or a subclass of `PipelineCallback` or `MultiPipelineCallbacks` that is called at the end of
+                each denoising step during the inference. with the following arguments: `callback_on_step_end(self:
+                DiffusionPipeline, step: int, timestep: int, callback_kwargs: Dict)`. `callback_kwargs` will include a
+                list of all tensors as specified by `callback_on_step_end_tensor_inputs`.
+            callback_on_step_end_tensor_inputs (`List`, *optional*):
+                The list of tensor inputs for the `callback_on_step_end` function. The tensors specified in the list
+                will be passed as `callback_kwargs` argument. You will only be able to include variables listed in the
+                `._callback_tensor_inputs` attribute of your pipeline class.
+            method (`str`, *optional*, defaults to "eps_greedy"):
+                The method to use for generation. Can be "eps_greedy", "zero_order", "beam", or "mcts".
+            params (`dict`, *optional*):
+                The parameters for the method.
+        
+        Examples:
+
+        Returns:
+            [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] or `tuple`:
+                If `return_dict` is `True`, [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] is returned,
+                otherwise a `tuple` is returned where the first element is a list with the generated images, the
+                second element is a list of `bool`s indicating whether the corresponding generated image contains
+                "not-safe-for-work" (nsfw) content, and the third element is a list of floats denoting scores for the generated images.
+        """
+
+        callback = kwargs.pop("callback", None)
+        callback_steps = kwargs.pop("callback_steps", None)
+
+        if callback is not None:
+            deprecate(
+                "callback",
+                "1.0.0",
+                "Passing `callback` as an input argument to `__call__` is deprecated, consider using `callback_on_step_end`",
+            )
+        if callback_steps is not None:
+            deprecate(
+                "callback_steps",
+                "1.0.0",
+                "Passing `callback_steps` as an input argument to `__call__` is deprecated, consider using `callback_on_step_end`",
+            )
+
+        if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
+            callback_on_step_end_tensor_inputs = callback_on_step_end.tensor_inputs
+
+        # 0. Default height and width to unet
+        if not height or not width:
+            height = (
+                self.unet.config.sample_size
+                if self._is_unet_config_sample_size_int
+                else self.unet.config.sample_size[0]
+            )
+            width = (
+                self.unet.config.sample_size
+                if self._is_unet_config_sample_size_int
+                else self.unet.config.sample_size[1]
+            )
+            height, width = height * self.vae_scale_factor, width * self.vae_scale_factor
+        # to deal with lora scaling and other possible forward hooks
+
+        # >>> 读取来自 main.py 的 rollout 超参 <<<
+        rollout_steps = int(params.get('rollout_steps', 0) or 0) if params else 0
+        rollout_gap = max(1, int(params.get('rollout_gap', 1) or 1)) if params else 1
+        downscale_factor = max(1, int(params.get('downscale_factor', 4) or 4)) if params else 4
+        rollout_only_mid = bool(params.get('rollout_only_mid', False)) if params else False
+
+        #re eval params
+        refine_threshold = float(params.get('refine_threshold', 0.0)) if params else 0.0
+        refine_top_m     = int(params.get('refine_top_m', 0))         if params else 0
+        refine_r         = int(params.get('refine_r', 2))             if params else 2
+        refine_gap       = int(params.get('refine_gap', 3))           if params else 3
+        refine_downscale = int(params.get('refine_downscale', 1))     if params else 1
+
+        #Top k + Clip
+        final_topk = int(params.get('final_topk', 0))   # 0 关闭
+
+
+        # 记录本次运行的 rollout 配置
+        print(
+            f"[rollout] enabled={rollout_steps>0} "
+            f"steps={rollout_steps} gap={rollout_gap} "
+            f"downscale={downscale_factor} only_mid={rollout_only_mid}",
+            flush=True,
+        )
+        # 统计总时长 & 仅“打分阶段”的时长
+        total_t0 = time.perf_counter(); _sync_cuda()
+        total_scoring_time = 0.0
+        # 如果你想要把每一步的最高分也汇总成数组
+        per_step_best = []
+        final_override_pil = None  # ★ 末步 Top-K + CLIP 终选的赢家（PIL）
+
+        # 1. Check inputs. Raise error if not correct
+        self.check_inputs(
+            prompt,
+            height,
+            width,
+            callback_steps,
+            negative_prompt,
+            prompt_embeds,
+            negative_prompt_embeds,
+            ip_adapter_image,
+            ip_adapter_image_embeds,
+            callback_on_step_end_tensor_inputs,
+        )
+
+        self._guidance_scale = guidance_scale
+        self._guidance_rescale = guidance_rescale
+        self._clip_skip = clip_skip
+        self._cross_attention_kwargs = cross_attention_kwargs
+        self._interrupt = False
+
+        # 2. Define call parameters
+        if prompt is not None and isinstance(prompt, str):
+            batch_size = 1
+        elif prompt is not None and isinstance(prompt, list):
+            batch_size = len(prompt)
+        else:
+            batch_size = prompt_embeds.shape[0]
+
+        device = self._execution_device
+
+        # 3. Encode input prompt
+        lora_scale = (
+            self.cross_attention_kwargs.get("scale", None) if self.cross_attention_kwargs is not None else None
+        )
+
+        prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+            prompt,
+            device,
+            num_images_per_prompt,
+            self.do_classifier_free_guidance,
+            negative_prompt,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            lora_scale=lora_scale,
+            clip_skip=self.clip_skip,
+        )
+
+        # For classifier free guidance, we need to do two forward passes.
+        # Here we concatenate the unconditional and text embeddings into a single batch
+        # to avoid doing two forward passes
+        if self.do_classifier_free_guidance:
+            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
+
+        if ip_adapter_image is not None or ip_adapter_image_embeds is not None:
+            image_embeds = self.prepare_ip_adapter_image_embeds(
+                ip_adapter_image,
+                ip_adapter_image_embeds,
+                device,
+                batch_size * num_images_per_prompt,
+                self.do_classifier_free_guidance,
+            )
+
+        # 4. Prepare timesteps
+        timesteps, num_inference_steps = retrieve_timesteps(
+            self.scheduler, num_inference_steps, device, timesteps, sigmas
+        )
+
+        # 5. Prepare latent variables
+        num_channels_latents = self.unet.config.in_channels
+        latents = self.prepare_latents(
+            batch_size * num_images_per_prompt,
+            num_channels_latents,
+            height,
+            width,
+            prompt_embeds.dtype,
+            device,
+            generator,
+            latents,
+        )
+
+        # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
+        extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
+
+        # 6.1 Add image embeds for IP-Adapter
+        added_cond_kwargs = (
+            {"image_embeds": image_embeds}
+            if (ip_adapter_image is not None or ip_adapter_image_embeds is not None)
+            else None
+        )
+
+        # 6.2 Optionally get Guidance Scale Embedding
+        timestep_cond = None
+        if self.unet.config.time_cond_proj_dim is not None:
+            guidance_scale_tensor = torch.tensor(self.guidance_scale - 1).repeat(batch_size * num_images_per_prompt)
+            timestep_cond = self.get_guidance_scale_embedding(
+                guidance_scale_tensor, embedding_dim=self.unet.config.time_cond_proj_dim
+            ).to(device=device, dtype=latents.dtype)
+
+        # 7. Denoising loop
+        max_score = None
+
+        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+        self._num_timesteps = len(timesteps)
+        
+        # adding my codes
+        rollout_steps = int(params.get('rollout_steps', 0) or 0)
+        rollout_gap = max(1, int(params.get('rollout_gap', 1) or 1))
+        downscale_factor = max(1, int(params.get('downscale_factor', 4) or 4))
+        rollout_only_mid = bool(params.get('rollout_only_mid', False))
+
+        if method == "beam": # ================================
+            best_latents = [copy.deepcopy(latents) for _ in range(params['B'])]
+
+            for i, t in tqdm(enumerate(timesteps)):
+                all_scored_latents = []
+                all_scores = []
+                
+                for beam_latents in best_latents:
+                    if self.interrupt:
+                        continue
+
+                    # expand the latents if we are doing classifier free guidance
+                    latent_model_input = torch.cat([beam_latents] * 2) if self.do_classifier_free_guidance else beam_latents
+                    latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+                    # predict the noise residual
+                    noise_pred = self.unet(
+                        latent_model_input,
+                        t,
+                        encoder_hidden_states=prompt_embeds,
+                        timestep_cond=timestep_cond,
+                        cross_attention_kwargs=self.cross_attention_kwargs,
+                        added_cond_kwargs=added_cond_kwargs,
+                        return_dict=False,
+                    )[0]
+
+                    # perform guidance
+                    if self.do_classifier_free_guidance:
+                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                        noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+                    if self.do_classifier_free_guidance and self.guidance_rescale > 0.0:
+                        # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
+                        noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=self.guidance_rescale)
+
+                    noise_candidates = [torch.randn_like(beam_latents) for _ in range(params['N'])]
+
+                    for noise_candidate in noise_candidates:
+                        latents_cand, pred_x0 = self.scheduler.step(noise_pred, t, beam_latents, variance_noise=noise_candidate, **extra_step_kwargs, return_dict=False)
+
+                        # expand the latents if we are doing classifier free guidance
+                        latent_model_input_tminusone = torch.cat([latents_cand] * 2) if self.do_classifier_free_guidance else latents_cand
+                        latent_model_input_tminusone = self.scheduler.scale_model_input(latent_model_input_tminusone, t)
+
+                        # predict the noise residual
+                        noise_pred_tminusone = self.unet(
+                            latent_model_input_tminusone,
+                            t,
+                            encoder_hidden_states=prompt_embeds,
+                            timestep_cond=timestep_cond,
+                            cross_attention_kwargs=self.cross_attention_kwargs,
+                            added_cond_kwargs=added_cond_kwargs,
+                            return_dict=False,
+                        )[0]
+
+                        # perform guidance
+                        if self.do_classifier_free_guidance:
+                            noise_pred_uncond_tminusone, noise_pred_text_tminusone = noise_pred_tminusone.chunk(2)
+                            noise_pred_tminusone = noise_pred_uncond_tminusone + self.guidance_scale * (noise_pred_text_tminusone - noise_pred_uncond_tminusone)
+
+                        if self.do_classifier_free_guidance and self.guidance_rescale > 0.0:
+                            # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
+                            noise_pred_tminusone = rescale_noise_cfg(noise_pred_tminusone, noise_pred_text_tminusone, guidance_rescale=self.guidance_rescale)
+
+                        next_latents, pred_next_tminusone = self.scheduler.step(noise_pred_tminusone, t, latents_cand, **extra_step_kwargs, return_dict=False)
+
+                        with torch.no_grad():
+                            image = self.vae.decode(pred_next_tminusone / self.vae.config.scaling_factor, return_dict=False, generator=generator)[0]
+                        # score image
+                        score = score_function(
+                            images = [(image * 127.5 + 128).clip(0, 255).to(torch.uint8)],
+                            prompts = [prompt],
+                            timesteps= None,
+                        )
+
+                        # Convert score to a Python float for reliable comparison
+                        if torch.is_tensor(score):
+                            # score might be a tensor of shape (1,) or scalar tensor
+                            score_value = score.item()
+                        else:
+                            score_value = float(score)
+
+                        # Store the actual next latents that were scored
+                        all_scored_latents.append(latents_cand)
+                        all_scores.append(score_value)
+                    
+                # Sort by scores and select top B candidates
+                sorted_indices = sorted(range(len(all_scores)), key=lambda k: all_scores[k], reverse=True)
+                best_indices = sorted_indices[:params['B']]
+                best_latents = [all_scored_latents[idx] for idx in best_indices]
+                
+                # Update callbacks only once per timestep
+                if callback_on_step_end is not None:
+                    callback_kwargs = {}
+                    for k in callback_on_step_end_tensor_inputs:
+                        callback_kwargs[k] = locals()[k]
+                    callback_kwargs["latents"] = best_latents[0]  # Use the best latent for callbacks
+                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+
+                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+                    negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
+
+                # call the callback, if provided
+                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                    if callback is not None and i % callback_steps == 0:
+                        step_idx = i // getattr(self.scheduler, "order", 1)
+                        callback(step_idx, t, best_latents[0])
+
+                if XLA_AVAILABLE:
+                    xm.mark_step()
+
+            # Select the best latent at the end
+            max_score = float('-inf')
+            latents = best_latents[0]
+            for latents_cand in best_latents:
+                with torch.no_grad():
+                    image = self.vae.decode(latents_cand / self.vae.config.scaling_factor, return_dict=False, generator=generator)[0]
+                score = score_function(
+                    images = [(image * 127.5 + 128).clip(0, 255).to(torch.uint8)],
+                    prompts = [prompt],
+                    timesteps= None,
+                )
+                score_value = score.item() if torch.is_tensor(score) else float(score)
+                if score_value > max_score:
+                    max_score = score_value
+                    latents = latents_cand
+             
+        elif method == "mcts": # ================================
+            @dataclass
+            class MCTSNode:
+                latents: torch.Tensor
+                children: List["MCTSNode"] = field(default_factory=list)
+                parent: Optional["MCTSNode"] = None
+                visits: int = 0
+                total_reward: float = 0.0
+                
+                def add_child(self, child_latents):
+                    child = MCTSNode(child_latents, parent=self)
+                    self.children.append(child)
+                    return child
+                
+                def ucb_score(self, exploration_constant=1.0):
+                    # If node hasn't been visited, give it infinite score for exploration
+                    if self.visits == 0:
+                        return float('inf')
+                    
+                    # Exploitation term
+                    exploitation = self.total_reward / self.visits
+                    
+                    # Exploration term
+                    parent_visits = self.parent.visits if self.parent else 1
+                    exploration = exploration_constant * math.sqrt(math.log(parent_visits) / self.visits)
+                    
+                    return exploitation + exploration
+            
+            # Process each timestep using MCTS
+            for i, t in tqdm(enumerate(timesteps)):
+                if self.interrupt:
+                    continue
+                
+                # Create root node with current latents
+                root = MCTSNode(latents)
+                root.visits = 1  # Initialize root node with one visit
+                
+                # Run multiple MCTS iterations for this timestep
+                for _ in range(params['S']):
+                    # Selection phase: traverse tree to find promising leaf node
+                    node = root
+                    while node.children and all(child.visits > 0 for child in node.children):
+                        # Choose child with highest UCB score
+                        node = max(node.children, key=lambda child: child.ucb_score(params.get('c', 1.414)))
+                    
+                    # Expansion phase: if node is not fully expanded, add a child
+                    if len(node.children) < params['N']:
+                        # Generate latent model input
+                        latent_model_input = torch.cat([node.latents] * 2) if self.do_classifier_free_guidance else node.latents
+                        latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                        
+                        # Predict noise residual
+                        noise_pred = self.unet(
+                            latent_model_input,
+                            t,
+                            encoder_hidden_states=prompt_embeds,
+                            timestep_cond=timestep_cond,
+                            cross_attention_kwargs=self.cross_attention_kwargs,
+                            added_cond_kwargs=added_cond_kwargs,
+                            return_dict=False,
+                        )[0]
+                        
+                        # Perform guidance
+                        if self.do_classifier_free_guidance:
+                            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                            noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
+                        
+                        if self.do_classifier_free_guidance and self.guidance_rescale > 0.0:
+                            noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=self.guidance_rescale)
+                        
+                        # Generate random noise and step
+                        noise = torch.randn_like(node.latents)
+                        child_latents, pred_x0 = self.scheduler.step(
+                            noise_pred, t, node.latents, variance_noise=noise, **extra_step_kwargs, return_dict=False
+                        )
+                        
+                        # Add child node
+                        child = node.add_child(child_latents)
+                        node = child
+                    
+                    # Simulation phase: evaluate the node by decoding and scoring
+                    # First get the predicted clean image
+                    latent_model_input = torch.cat([node.latents] * 2) if self.do_classifier_free_guidance else node.latents
+                    latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                    
+                    noise_pred = self.unet(
+                        latent_model_input,
+                        t,
+                        encoder_hidden_states=prompt_embeds,
+                        timestep_cond=timestep_cond,
+                        cross_attention_kwargs=self.cross_attention_kwargs,
+                        added_cond_kwargs=added_cond_kwargs,
+                        return_dict=False,
+                    )[0]
+                    
+                    if self.do_classifier_free_guidance:
+                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                        noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
+                    
+                    if self.do_classifier_free_guidance and self.guidance_rescale > 0.0:
+                        noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=self.guidance_rescale)
+                    
+                    # Do full naive sampling from current timestep to end
+                    temp_latents = node.latents.clone()
+                    for j in range(i, len(timesteps)):
+                        t_inner = timesteps[j]
+                        
+                        # expand the latents if we are doing classifier free guidance
+                        latent_model_input_inner = torch.cat([temp_latents] * 2) if self.do_classifier_free_guidance else temp_latents
+                        latent_model_input_inner = self.scheduler.scale_model_input(latent_model_input_inner, t_inner)
+                        
+                        # predict the noise residual
+                        noise_pred_inner = self.unet(
+                            latent_model_input_inner,
+                            t_inner,
+                            encoder_hidden_states=prompt_embeds,
+                            timestep_cond=timestep_cond,
+                            cross_attention_kwargs=self.cross_attention_kwargs,
+                            added_cond_kwargs=added_cond_kwargs,
+                            return_dict=False,
+                        )[0]
+                        
+                        # perform guidance
+                        if self.do_classifier_free_guidance:
+                            noise_pred_uncond_inner, noise_pred_text_inner = noise_pred_inner.chunk(2)
+                            noise_pred_inner = noise_pred_uncond_inner + self.guidance_scale * (noise_pred_text_inner - noise_pred_uncond_inner)
+                        
+                        if self.do_classifier_free_guidance and self.guidance_rescale > 0.0:
+                            noise_pred_inner = rescale_noise_cfg(noise_pred_inner, noise_pred_text_inner, guidance_rescale=self.guidance_rescale)
+                        
+                        # Step with deterministic noise (zero noise for deterministic sampling)
+                        temp_latents, _ = self.scheduler.step(
+                            noise_pred_inner, t_inner, temp_latents, **extra_step_kwargs, return_dict=False
+                        )
+                    
+                    # The final temp_latents is our pred_x0
+                    pred_x0 = temp_latents
+                
+                # Select best child after all iterations
+                if root.children:
+                    best_child = max(root.children, key=lambda child: child.total_reward / child.visits if child.visits > 0 else -float('inf'))
+                    latents = best_child.latents
+                
+                # Callbacks
+                if callback_on_step_end is not None:
+                    callback_kwargs = {}
+                    for k in callback_on_step_end_tensor_inputs:
+                        callback_kwargs[k] = locals()[k]
+                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+
+                    latents = callback_outputs.pop("latents", latents)
+                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+                    negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
+
+                # call the callback, if provided
+                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                    if callback is not None and i % callback_steps == 0:
+                        step_idx = i // getattr(self.scheduler, "order", 1)
+                        callback(step_idx, t, latents)
+
+                if XLA_AVAILABLE:
+                    xm.mark_step()
+        
+        else: # ================================
+            last_step_imgs = []   # 放 for 外面（只初始化一次）[(PIL.Image, noise_candidate, inner_score)]
+
+            for i, t in tqdm(enumerate(timesteps)):
+                is_last_step = (i == len(timesteps) - 1)   # ← 每步重算
+                step_scoring_time = 0.0
+                step_best = -float("inf")
+
+                if self.interrupt:
+                    continue
+
+                # --- UNet 预测 ---
+                latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
+                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                noise_pred = self.unet(
+                    latent_model_input, t,
+                    encoder_hidden_states=prompt_embeds,
+                    timestep_cond=timestep_cond,
+                    cross_attention_kwargs=self.cross_attention_kwargs,
+                    added_cond_kwargs=added_cond_kwargs,
+                    return_dict=False,
+                )[0]
+                if self.do_classifier_free_guidance:
+                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
+                if self.do_classifier_free_guidance and self.guidance_rescale > 0.0:
+                    noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=self.guidance_rescale)
+
+                # ---- eps_greedy / zero_order ----
+                if method in ("eps_greedy", "zero_order"):
+
+                    # ===== 末段线性抬升 epsilon（不改 λ）=====
+                    base_eps = float(params.get('eps', 0.2))
+                    last_k   = int(params.get('final_last_k', 6))
+                    boost    = float(params.get('final_eps_boost', 2.0))
+                    in_last_window = (i >= len(timesteps) - last_k)
+                    if in_last_window and last_k > 1:
+                        prog = (i - (len(timesteps) - last_k)) / (last_k - 1)  # 0→1
+                        eps_eff = min(1.0, base_eps * (1.0 + boost * prog))
+                    else:
+                        eps_eff = base_eps
+                    # ========================================
+
+                    K = int(params.get('K', 1))
+                    N = int(params.get('N', 4))
+                    lam = float(params.get('lambda', 0.15))
+                    refine_threshold = float(params.get('refine_threshold', 0.0))
+                    refine_top_m     = int(params.get('refine_top_m', 0))
+                    refine_r         = int(params.get('refine_r', 0))
+                    refine_gap       = int(params.get('refine_gap', 1))
+                    refine_downscale = int(params.get('refine_downscale', 1))
+                    final_topk       = int(params.get('final_topk', 0))
+
+                    pivot = torch.randn_like(latents)  # 初始 pivot；后面会被粗排/复评 winner 覆盖
+
+                    for _ in range(K):
+                        noise2score = {}
+                        step_scoring_time = 0.0
+                        step_best = -float("inf")
+
+                        # 生成 N 个候选噪声
+                        noise_candidates = []
+                        for _ in range(N):
+                            r = torch.rand(1).item()
+                            if r < (eps_eff if method == "eps_greedy" else 0.0):
+                                # 全局重采：更大探索
+                                noise_candidates.append(torch.randn_like(latents))
+                            else:
+                                # pivot 邻域（半径按原实现）
+                                to_add = torch.randn_like(latents)
+                                to_add = to_add / torch.norm(to_add)
+                                radius = lam * np.sqrt(latents.shape[-1] * latents.shape[-2] * latents.shape[-3])
+                                noise_candidates.append(pivot + to_add * torch.rand(1).item() * radius)
+
+                        for noise_candidate in noise_candidates:
+                            # 先从 t 迈出候选一步
+                            latents_cand, pred_x0 = self.scheduler.step(
+                                noise_pred, t, latents, variance_noise=noise_candidate, **extra_step_kwargs, return_dict=False
+                            )
+
+                            # 是否做 rollout（中段门控）
+                            use_rollout = (rollout_steps > 0)
+                            if use_rollout and rollout_only_mid:
+                                # —— 这里用你那段“基于噪声强度的门控”判定 pos ∈ [0,1] 并置 use_rollout —— 
+                                # (保持你现有的实现，不再赘述)
+                                pass
+
+                            _sync_cuda()
+                            sc_t0 = time.perf_counter()
+
+                            # 两条评分路径：rollout 或 直接 x0
+                            image_for_cache = None  # 末步缓存用
+                            if use_rollout:
+                                score = _rollout_score_candidate(
+                                    latents_cand, i + 1, self, self.scheduler.timesteps,
+                                    score_function, prompt if isinstance(prompt, str) else prompt[0],
+                                    rollout_steps, rollout_gap, downscale_factor,
+                                    prompt_embeds, timestep_cond, added_cond_kwargs, extra_step_kwargs
+                                )
+                                # ★ 若也想缓存 rollout 路径的图像，可在 _rollout_score_candidate 里让它返回(x0或pil, score)
+                                #   这里我们就不缓存 rollout 的图，避免未定义 image
+                            else:
+                                latent_model_input_tminusone = self.scheduler.scale_model_input(
+                                    torch.cat([latents_cand] * 2) if self.do_classifier_free_guidance else latents_cand, t
+                                )
+                                cross_kwargs = getattr(self, "_cross_attention_kwargs", None) or getattr(self, "cross_attention_kwargs", None)
+                                noise_pred_tminusone = self.unet(
+                                    latent_model_input_tminusone, t,
+                                    encoder_hidden_states=prompt_embeds,
+                                    timestep_cond=timestep_cond,
+                                    cross_attention_kwargs=cross_kwargs,
+                                    added_cond_kwargs=added_cond_kwargs,
+                                    return_dict=False,
+                                )[0]
+                                if self.do_classifier_free_guidance:
+                                    npu, npt = noise_pred_tminusone.chunk(2)
+                                    noise_pred_tminusone = npu + self.guidance_scale * (npt - npu)
+                                if self.do_classifier_free_guidance and self.guidance_rescale > 0.0:
+                                    noise_pred_tminusone = rescale_noise_cfg(noise_pred_tminusone, npt, guidance_rescale=self.guidance_rescale)
+
+                                _, pred_next_tminusone = self.scheduler.step(
+                                    noise_pred_tminusone, t, latents_cand, **extra_step_kwargs, return_dict=False
+                                )
+                                with torch.no_grad():
+                                    image = self.vae.decode(
+                                        pred_next_tminusone / self.vae.config.scaling_factor, return_dict=False, generator=generator
+                                    )[0]
+                                score = score_function(
+                                    images=[(image * 127.5 + 128).clamp(0, 255).to(torch.uint8)],
+                                    prompts=[prompt if isinstance(prompt, str) else prompt[0]],
+                                    timesteps=None,
+                                )
+                                image_for_cache = image  # 只有非 rollout 分支我们手里有 image
+
+                            _sync_cuda()
+                            step_scoring_time += (time.perf_counter() - sc_t0)
+
+                            # 记录分数
+                            sv = score.item() if torch.is_tensor(score) else float(score)
+                            noise2score[noise_candidate] = sv
+                            step_best = max(step_best, sv)
+
+                            # 末步：只缓存非 rollout 分支的图，避免未定义
+                            if is_last_step and final_topk > 0 and image_for_cache is not None:
+                                img_pil = self.image_processor.postprocess(image_for_cache, output_type="pil")[0]
+                                last_step_imgs.append((img_pil, noise_candidate, sv))
+
+                        # ===== 候选循环结束：自适应 Top-M 复评 =====
+                        if not noise2score:
+                            pivot = torch.randn_like(latents)
+                            max_score = -float("inf")
+                        else:
+                            cand_sorted = sorted(noise2score.items(), key=lambda kv: kv[1], reverse=True)
+                            top1_noise, top1_score = cand_sorted[0]
+                            top2_score = cand_sorted[1][1] if len(cand_sorted) > 1 else -float("inf")
+                            gap12 = float(top1_score - top2_score)
+                            print("[gap12] ", gap12)
+
+                            # ★ 差距小才复评
+                            trigger_refine = (refine_threshold > 0.0 and gap12 < refine_threshold and refine_top_m > 0)
+
+                            if trigger_refine:
+                                M = min(refine_top_m, len(cand_sorted))
+                                top_noises = [kv[0] for kv in cand_sorted[:M]]
+                                print(f"[refine] trigger Top-{M} re-eval (Δ={gap12:.6f} < {refine_threshold}) "
+                                      f"with r={refine_r}, gap={refine_gap}, downscale={refine_downscale}", flush=True)
+                                refined = {}
+                                for n in top_noises:
+                                    lat_cand, _ = self.scheduler.step(
+                                        noise_pred, t, latents, variance_noise=n, **extra_step_kwargs, return_dict=False
+                                    )
+                                    s_ref = _rollout_score_candidate(
+                                        lat_cand, i + 1, self, self.scheduler.timesteps,
+                                        score_function, prompt if isinstance(prompt, str) else prompt[0],
+                                        refine_r, refine_gap, refine_downscale,
+                                        prompt_embeds, timestep_cond, added_cond_kwargs, extra_step_kwargs
+                                    )
+                                    refined[n] = float(s_ref)
+                                noise2score.update(refined)
+                                pivot = max(refined, key=refined.get)
+                                max_score = refined[pivot]
+                                print(f"[refine] refined winner score={max_score:.6f}; raw_winner_score={top1_score:.6f}", flush=True)
+                            else:
+                                pivot = top1_noise
+                                max_score = top1_score
+
+                        # ===== 每步日志 =====
+                        print(f"[denoise {i+1}/{len(timesteps)} | t={int(t)}] best_score={step_best:.6f} "
+                              f"scoring_time={step_scoring_time:.3f}s", flush=True)
+                        total_scoring_time += step_scoring_time
+                        per_step_best.append(step_best)
+
+                    # ===== 末步 Top-K + CLIP 终选（放在 K 循环之后、这一大步的最后）=====
+                    if is_last_step and final_topk > 0 and len(last_step_imgs) > 0:
+                        # 先按环内分数粗排，取前 K 做 CLIP 终评
+                        last_step_imgs.sort(key=lambda x: x[2], reverse=True)
+                        select = last_step_imgs[:min(final_topk, len(last_step_imgs))]
+                      
+                        clip_scorer = CLIPScorer(dtype=torch.float32)
+                        best_img, best_clip = None, -1e9
+                        for img_pil, _n, _inner in select:
+                            arr = np.array(img_pil.convert("RGB"), copy=False)
+                            timg = torch.from_numpy(arr).permute(2,0,1).unsqueeze(0)
+                            s = clip_scorer(images=[timg], prompts=[prompt if isinstance(prompt,str) else prompt[0]], timesteps=None)
+                            s = float(s.item() if torch.is_tensor(s) else s)
+                            if s > best_clip:
+                                best_clip, best_img = s, img_pil
+                        if best_img is not None:
+                            # 覆盖最终输出（按你当前管线的返回对象设置）
+                            images = [best_img]
+                            if best_img is not None:
+                              final_override_pil = best_img    # ★ 记住赢家（PIL）
+                              print(f"[final-topK] K={final_topk} CLIP best = {best_clip:.6f}", flush=True)
+
+
+
+
+                
+                latents, _ = self.scheduler.step(noise_pred, t, latents, variance_noise=pivot, **extra_step_kwargs, return_dict=False)
+
+                if callback_on_step_end is not None:
+                    callback_kwargs = {}
+                    for k in callback_on_step_end_tensor_inputs:
+                        callback_kwargs[k] = locals()[k]
+                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+
+                    latents = callback_outputs.pop("latents", latents)
+                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+                    negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
+
+                # call the callback, if provided
+                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                    # progress_bar.update()
+                    if callback is not None and i % callback_steps == 0:
+                        step_idx = i // getattr(self.scheduler, "order", 1)
+                        callback(step_idx, t, latents)
+
+                if XLA_AVAILABLE:
+                    xm.mark_step()
+
+        # ================================
+
+        # For regular mode, use the standard output code
+        # ★ 若末步 Top-K + CLIP 有赢家，则直接用那张 PIL 覆盖最终输出
+        if final_override_pil is not None:
+          arr = np.array(final_override_pil.convert("RGB"), copy=False)  # H,W,3 uint8
+          image = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(device=latents.device, dtype=torch.float32)
+          image = (image / 255.0 - 0.5) * 2.0  # 转到 [-1, 1]，与 VAE decode 一致
+          has_nsfw_concept = None
+        else:
+          if not output_type == "latent":
+            image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False, generator=generator)[0]
+            has_nsfw_concept = None
+          else:
+            image = latents
+            has_nsfw_concept = None
+
+        
+        if max_score is None:
+            max_score = score_function(
+                images = [(image * 127.5 + 128).clip(0, 255).to(torch.uint8)],
+                prompts = [prompt],
+                timesteps= None,
+            )
+        
+        # Postprocess the image
+        if has_nsfw_concept is None:
+            do_denormalize = [True] * image.shape[0]
+        else:
+            do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
+        
+        image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
+        
+        # Offload all models
+        self.maybe_free_model_hooks()
+        _sync_cuda()
+        total_dt = time.perf_counter() - total_t0
+        print(
+            f"[summary] downscale={downscale_factor} "
+            f"rollout_steps={rollout_steps} gap={rollout_gap} only_mid={rollout_only_mid} "
+            f"total_scoring_time={total_scoring_time:.3f}s total_time={total_dt:.3f}s",
+            flush=True,
+        )
+        
+        return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept), max_score
