@@ -25,3 +25,7 @@ dependencies:
     - accelerate
     - image-reward
     - diffusers
+    - clip
+    - timm
+    - fairscale
+    - huggingface-hub
