@@ -23,3 +23,5 @@ dependencies:
     - matplotlib
     - torchvision
     - accelerate
+    - image-reward
+    - diffusers
