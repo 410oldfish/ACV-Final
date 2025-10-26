@@ -10,6 +10,8 @@ import torchvision.models as models
 import torchvision.transforms as transforms
 import urllib.request
 import io
+import ImageReword as RM
+from difussers import ControlNetModel, StableDiffusionControlNetPipeline
 
 class Scorer(torch.nn.Module):
     """Base class for all scorers"""
@@ -52,6 +54,58 @@ class BrightnessScorer(Scorer):
         luminance = torch.clamp(luminance, 0.0, 1.0)
             
         return luminance
+
+class ImageRewordScorer(Scorer):
+    def __init__(self, dtype=torch.float32):
+        super().__init__(dtype)
+        self.model = RM.load("ImageReward-v1.0")
+    
+    def __call__(self, images, prompts, timesteps):
+        return self.model.score(images, prompts)
+    
+class OneStepGenerationScorer(Scorer):
+    s
+    def __init__(self, dtype=torch.float32):
+        super().__init__(dtype)
+        self.device = "cuda"
+        self.weight_type = torch.float16
+        controlnet = ControlNetModel.from_pretrained(
+            "IDKiro/sdxs-512-dreamshaper-sketch", torch_dtype=self.weight_type
+        ).to(self.device)
+        self.scorer_pipe = StableDiffusionControlNetPipeline.from_pretrained(
+            "IDKiro/sdxs-512-dreamshaper", controlnet=controlnet, torch_dtype=self.weight_type
+        )
+        self.scorer_pipe.to(self.device)
+        self.controlnet_condition_scale = 0
+        self.model = RM.load("ImageReward-v1.0")
+
+    def __call__(self, images, prompts):
+
+        OneStepImage = self.run(images, prompts)
+        score = self.model.score(OneStepImage, prompts)
+        return score
+    
+    def run(self,image, prompt):
+        
+        self.scorer_pipe.to(torch_device=self.device, torch_dtype=self.weight_type)
+
+        control_image = image.convert("RGB")
+        control_image = Image.fromarray(255 - np.array(control_image))
+
+        output_pil = self.scorer_pipe(
+            prompt=prompt,
+            image=control_image,
+            width=512,
+            height=512,
+            guidance_scale=0.0,
+            num_inference_steps=1,
+            num_images_per_prompt=1,
+            output_type="pil",
+            controlnet_conditioning_scale=self.controlnet_conditioning_scale,
+        ).images[0]
+
+        return  output_pil
+
 
 class ImageNetScorer(Scorer):
     def __init__(self, dtype=torch.float32):

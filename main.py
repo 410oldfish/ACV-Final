@@ -73,7 +73,7 @@ def import_edm():
     sys.path.insert(0, str(edm_dir))
     dnnlib = importlib.import_module('dnnlib')
     dnnlib_util = importlib.import_module('dnnlib.util')
-    from scorers import BrightnessScorer, CompressibilityScorer, ImageNetScorer
+    from scorers import BrightnessScorer, CompressibilityScorer, ImageNetScorer, OneStepGenerationScorer
     return dnnlib, dnnlib_util, BrightnessScorer, CompressibilityScorer, ImageNetScorer
 
 # =========================
@@ -88,13 +88,13 @@ def import_sd():
     spec.loader.exec_module(sys.modules['diffusers'])
     from diffusers import StableDiffusionPipeline, DDIMScheduler
     sys.path.insert(0, str(sd_dir))
-    from scorers import BrightnessScorer, CompressibilityScorer, CLIPScorer
-    return StableDiffusionPipeline, DDIMScheduler, BrightnessScorer, CompressibilityScorer, CLIPScorer
+    from scorers import BrightnessScorer, CompressibilityScorer, CLIPScorer, ImageRewordScorer, OneStepGenerationScorer
+    return StableDiffusionPipeline, DDIMScheduler, BrightnessScorer, CompressibilityScorer, CLIPScorer, ImageRewordScorer
 
 # =========================
 # Scorer Factory
 # =========================
-def get_scorer(backend, scorer_name, BrightnessScorer, CompressibilityScorer, CLIPScorer=None, ImageNetScorer=None):
+def get_scorer(backend, scorer_name, BrightnessScorer, CompressibilityScorer, CLIPScorer=None, ImageNetScorer=None, ImageRewordScorer=None, OneStepGenerationScorer=None):
     """Return the appropriate scorer instance for the backend and scorer name."""
     if scorer_name == 'brightness':
         return BrightnessScorer(dtype=torch.float32)
@@ -102,6 +102,10 @@ def get_scorer(backend, scorer_name, BrightnessScorer, CompressibilityScorer, CL
         return CompressibilityScorer(dtype=torch.float32)
     elif scorer_name == 'clip' and backend == 'sd':
         return CLIPScorer(dtype=torch.float32)
+    elif scorer_name == 'imagereword' and backend == 'sd':
+        return ImageRewordScorer(dtype=torch.float32)
+    elif scorer_name == 'onestepgeneration' and backend == 'sd':
+        return OneStepGenerationScorer(dtype=torch.float32)
     elif scorer_name == 'imagenet' and backend == 'edm':
         return ImageNetScorer(dtype=torch.float32)
     else:
@@ -220,8 +224,8 @@ def main():
     # SD Backend
     # -----------
     if args.backend == 'sd':
-        StableDiffusionPipeline, DDIMScheduler, BrightnessScorer, CompressibilityScorer, CLIPScorer = import_sd()
-        scorer = get_scorer('sd', args.scorer, BrightnessScorer, CompressibilityScorer, CLIPScorer=CLIPScorer)
+        StableDiffusionPipeline, DDIMScheduler, BrightnessScorer, CompressibilityScorer, CLIPScorer, ImageRewordScorer, OneStepGenerationScorer= import_sd()
+        scorer = get_scorer('sd', args.scorer, BrightnessScorer, CompressibilityScorer, CLIPScorer=CLIPScorer, ImageRewordScorer=ImageRewordScorer, OneStepGenerationScorer=OneStepGenerationScorer)
 
         model_id = "runwayml/stable-diffusion-v1-5"
         local_scheduler = DDIMScheduler.from_pretrained(model_id, subfolder="scheduler")
@@ -361,8 +365,8 @@ def main():
     # EDM Backend
     # -----------
     elif args.backend == 'edm':
-        dnnlib, dnnlib_util, BrightnessScorer, CompressibilityScorer, ImageNetScorer = import_edm()
-        scorer = get_scorer('edm', args.scorer, BrightnessScorer, CompressibilityScorer, ImageNetScorer=ImageNetScorer)
+        dnnlib, dnnlib_util, BrightnessScorer, CompressibilityScorer, ImageNetScorer, ImageRewordScorer, OneStepGenerationScorer = import_edm()
+        scorer = get_scorer('edm', args.scorer, BrightnessScorer, CompressibilityScorer, ImageNetScorer=ImageNetScorer, ImageRewordScorer=ImageRewordScorer=None, OneStepGenerationScorer=None)
 
         # EDM defaults
         model_root = 'https://nvlabs-fi-cdn.nvidia.com/edm/pretrained'
