@@ -168,15 +168,29 @@ def main():
     # New parameters
     parser.add_argument('--rollout_steps', type=int, default=0,
     help='>0 启用多步前瞻评分：每个候选额外前瞻的步数 r（建议 2~3）。')
-    parser.add_argument('--rollout_gap', type=int, default=1,
+    parser.add_argument('--rollout_gap', type=int, default=3,
     help='前瞻步的“跳步间隔”，gap=2 表示每次跳过 1 个 timestep。')
-    parser.add_argument('--downscale_factor', type=int, default=4,
+    parser.add_argument('--downscale_factor', type=int, default=2,
     help='前瞻末尾解码后的下采样比例；4 表示边长/4。')
     parser.add_argument('--rollout_only_mid', action='store_true',
     help='只在中间 σ 区间做前瞻，其他步仍用即时 x̂0 打分（省算力）。')
 
+    # Speculative Sampling
+    # ===== Speculative（窗口推进）开关与超参 =====
+    parser.add_argument('--spec_enable', action='store_true',
+    help='Enable speculative windowed sampling (Frozen Target Draft).')
+    parser.add_argument('--spec_L', type=int, default=5,
+    help='Window length L (number of timesteps per window).')
+    parser.add_argument('--spec_accept', type=str, default='none', choices=['none','end_step'],
+    help="Window-end acceptance: 'none' (just accept winner), or 'end_step' (run 1 UNet at window end to correct).")
+
+    parser.add_argument('--spec_draft_down', type=int, default=2,
+    help='Downscale factor for low-res draft UNet (2 => latent H,W /2).')
+
+
+
     #Top-M , auto-rollout
-    parser.add_argument('--refine_threshold', type=float, default=0.015,
+    parser.add_argument('--refine_threshold', type=float, default=0,
         help="Only trigger Top-M re-eval if (top1 - top2) < threshold; set 0 to disable")
     parser.add_argument('--refine_top_m', type=int, default=3,
         help="How many top candidates to re-evaluate when triggered")
@@ -205,6 +219,21 @@ def main():
     parser.add_argument('--final_eval', type=str, default=None)
     parser.add_argument('--final_eval_views', type=int, default=1)
     parser.add_argument('--final_eval_center_crop', action='store_true')
+
+    # --- Momentum across timesteps ---
+    parser.add_argument('--mom_enable', action='store_true',
+        help='Enable cross-timestep momentum for the initial pivot of each step.')
+    parser.add_argument('--mom_beta', type=float, default=0.5,
+        help='EMA weight (0..1). Higher = follow previous step winner more.')
+    parser.add_argument('--mom_warmup', type=int, default=3,
+        help='Disable momentum for the first few timesteps to avoid early bias.')
+
+    #la noise
+    parser.add_argument('--la_noise_only', action='store_true',
+    help='Lookahead without extra UNet: use scheduler + fixed noise_pred to roll r steps.')
+    parser.add_argument('--la_zero_var', action='store_true',
+        help='When noise-only lookahead, set eta=0 for forward hops (deterministic).')
+
 
     args = parser.parse_args()
 
@@ -242,6 +271,17 @@ def main():
             'K': args.K,
             'B': args.B,
             'S': args.S,
+            # --- 新增：Speculative 参数 ---
+            'spec_enable': bool(args.spec_enable),
+            'spec_L': int(args.spec_L),
+            'spec_accept': args.spec_accept,   # 'none' 或 'end_step'
+            'spec_draft_down': int(args.spec_draft_down),   # ★ 新增
+            # --- Momentum across timesteps ---
+            'mom_enable': bool(args.mom_enable),
+            'mom_beta': float(args.mom_beta),
+            'mom_warmup': int(args.mom_warmup),
+            'la_noise_only': bool(args.la_noise_only),
+            'la_zero_var': bool(args.la_zero_var),
         }
         MASTER_PARAMS.update({
             'rollout_steps': args.rollout_steps,

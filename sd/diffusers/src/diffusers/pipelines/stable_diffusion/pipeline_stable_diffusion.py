@@ -176,6 +176,65 @@ def _rollout_score_candidate(
         score = scorer_fn(images=[img_uint8], prompts=[prompt], timesteps=None)
         return score.item() if torch.is_tensor(score) else float(score)
 
+def _lookahead_noise_only(
+    latent_start: torch.Tensor,
+    start_index: int,
+    pipe,
+    timesteps: list,
+    fixed_noise_pred: torch.Tensor,   # ★ 当前步算好的 noise_pred(x_t, t)
+    scorer_fn, prompt: str,
+    r: int = 1, gap: int = 3,
+    downscale_factor: int = 1,
+    extra_step_kwargs: dict = None,
+    use_zero_variance: bool = True,   # ★ 后续前瞻步是否注入 0 噪声（建议 True）
+    generator: torch.Generator = None
+):
+    """
+    仅用 scheduler 的封闭式步进 + 固定的 noise_pred 做 r 次“无 UNet 前瞻”。
+    返回评分（float）。
+    """
+    if extra_step_kwargs is None:
+        extra_step_kwargs = {}
+
+    lat = latent_start
+    idx = start_index
+    pred_x0_last = None
+
+    # 为了前瞻更稳，强制去掉后续 eta 噪声
+    step_kwargs = dict(extra_step_kwargs)
+    if use_zero_variance:
+        step_kwargs['eta'] = 0.0
+
+    # r 次“跳 gap”前瞻
+    max_hops = max(0, min(r, (len(timesteps) - start_index + gap - 1)//gap))
+    for _ in range(max_hops):
+        if idx >= len(timesteps):
+            break
+        t = timesteps[idx]
+        # 注意：这里用“固定的 fixed_noise_pred”，而非重算 UNet
+        lat, pred_x0_last = pipe.scheduler.step(
+            fixed_noise_pred, t, lat,
+            variance_noise=None,             # 额外噪声不注入（可按需改成固定 z）
+            return_dict=False, **step_kwargs
+        )
+        idx += gap
+
+    # 末端解码 + 打分（与现有逻辑一致）
+    to_decode = pred_x0_last if pred_x0_last is not None else lat
+    imgs = pipe.vae.decode(to_decode / pipe.vae.config.scaling_factor).sample  # [-1,1]
+    imgs = (imgs.clamp(-1, 1) + 1) / 2.0
+
+    if downscale_factor and downscale_factor > 1:
+        h, w = imgs.shape[-2:]
+        imgs = F.interpolate(
+            imgs, size=(max(1, h // downscale_factor), max(1, w // downscale_factor)),
+            mode="area", align_corners=None
+        )
+
+    img_uint8 = (imgs * 127.5 + 128).clamp(0, 255).to(torch.uint8)
+    score = scorer_fn(images=[img_uint8], prompts=[prompt], timesteps=None)
+    return score.item() if torch.is_tensor(score) else float(score)
+
 
 def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
     r"""
@@ -1058,7 +1117,15 @@ class StableDiffusionPipeline(
 
         #Top k + Clip
         final_topk = int(params.get('final_topk', 0))   # 0 关闭
+		
+		#movement d
+        mom_enable  = bool(params.get('mom_enable', False)) if params else False
+        mom_beta    = float(params.get('mom_beta', 0.5))    if params else 0.5  # 0~1，越大越依赖上一步
+        mom_warmup  = int(params.get('mom_warmup', 3))      if params else 3    # 前几步不启用动量，避免早期不稳定
+        prev_pivot_noise = None  # 保存上一步的 winner（作为下一步的惯性方向）		
 
+        la_noise_only = bool(params.get('la_noise_only', False)) if params else False
+        la_use_zero_variance = bool(params.get('la_zero_var', True)) if params else True
 
         # 记录本次运行的 rollout 配置
         print(
@@ -1479,6 +1546,7 @@ class StableDiffusionPipeline(
 
             for i, t in tqdm(enumerate(timesteps)):
                 is_last_step = (i == len(timesteps) - 1)   # ← 每步重算
+                is_last_r_step = (i >= len(timesteps) - rollout_gap)
                 step_scoring_time = 0.0
                 step_best = -float("inf")
 
@@ -1510,7 +1578,12 @@ class StableDiffusionPipeline(
                     last_k   = int(params.get('final_last_k', 6))
                     boost    = float(params.get('final_eps_boost', 2.0))
                     in_last_window = (i >= len(timesteps) - last_k)
-                    if in_last_window and last_k > 1:
+                    in_start_window = (i <= last_k)
+                    if in_start_window and last_k > 1:
+                      prog = (last_k - i + 1) / last_k  # 0→1
+                      eps_eff = min(1.0, base_eps * (1.0 + boost * prog))
+					
+                    elif in_last_window and last_k > 1:
                         prog = (i - (len(timesteps) - last_k)) / (last_k - 1)  # 0→1
                         eps_eff = min(1.0, base_eps * (1.0 + boost * prog))
                     else:
@@ -1527,7 +1600,16 @@ class StableDiffusionPipeline(
                     refine_downscale = int(params.get('refine_downscale', 1))
                     final_topk       = int(params.get('final_topk', 0))
 
-                    pivot = torch.randn_like(latents)  # 初始 pivot；后面会被粗排/复评 winner 覆盖
+                    #pivot = torch.randn_like(latents)  # 初始 pivot；后面会被粗排/复评 winner 覆盖
+                    # === 初始化本步的初始 pivot（跨步动量只在这里生效一次） ===
+                    if mom_enable and (prev_pivot_noise is not None) and (i >= mom_warmup):
+                      # 用上一时刻的 winner 噪声做 EMA：越靠后步，越沿既有“好方向”起步
+                      noise0 = torch.randn_like(latents)
+                      pivot  = (1.0 - mom_beta) * noise0 + mom_beta * prev_pivot_noise
+                      print("mom")
+                    else:
+                      pivot  = torch.randn_like(latents)
+
 
                     for _ in range(K):
                         noise2score = {}
@@ -1555,11 +1637,9 @@ class StableDiffusionPipeline(
                             )
 
                             # 是否做 rollout（中段门控）
-                            use_rollout = (rollout_steps > 0)
+                            use_rollout = (rollout_steps > 0 and not is_last_r_step)
                             if use_rollout and rollout_only_mid:
-                                # —— 这里用你那段“基于噪声强度的门控”判定 pos ∈ [0,1] 并置 use_rollout —— 
-                                # (保持你现有的实现，不再赘述)
-                                pass
+                                use_rollout = i < 40
 
                             _sync_cuda()
                             sc_t0 = time.perf_counter()
@@ -1567,11 +1647,25 @@ class StableDiffusionPipeline(
                             # 两条评分路径：rollout 或 直接 x0
                             image_for_cache = None  # 末步缓存用
                             if use_rollout:
+                              if la_noise_only:
+                                # ★ 用“噪声偏移前瞻”：固定当前步的 noise_pred，跳 gap 前瞻 r 次
+                                score = _lookahead_noise_only(
+                                  latents_cand, i + 1, self, self.scheduler.timesteps,
+                                  fixed_noise_pred=noise_pred,          # ★ 当前步已算好的
+                                  scorer_fn=score_function,
+                                  prompt=(prompt if isinstance(prompt, str) else prompt[0]),
+                                  r=rollout_steps, gap=rollout_gap,
+                                  downscale_factor=downscale_factor,
+                                  extra_step_kwargs=extra_step_kwargs,
+                                  use_zero_variance=la_use_zero_variance,
+                                  generator=generator,
+                                )
+                              else:
                                 score = _rollout_score_candidate(
-                                    latents_cand, i + 1, self, self.scheduler.timesteps,
-                                    score_function, prompt if isinstance(prompt, str) else prompt[0],
-                                    rollout_steps, rollout_gap, downscale_factor,
-                                    prompt_embeds, timestep_cond, added_cond_kwargs, extra_step_kwargs
+                                  latents_cand, i + 1, self, self.scheduler.timesteps,
+                                  score_function, prompt if isinstance(prompt, str) else prompt[0],
+                                  rollout_steps, rollout_gap, downscale_factor,
+                                  prompt_embeds, timestep_cond, added_cond_kwargs, extra_step_kwargs
                                 )
                                 # ★ 若也想缓存 rollout 路径的图像，可在 _rollout_score_candidate 里让它返回(x0或pil, score)
                                 #   这里我们就不缓存 rollout 的图，避免未定义 image
@@ -1665,6 +1759,7 @@ class StableDiffusionPipeline(
                               f"scoring_time={step_scoring_time:.3f}s", flush=True)
                         total_scoring_time += step_scoring_time
                         per_step_best.append(step_best)
+                        prev_pivot_noise = pivot.detach()
 
                     # ===== 末步 Top-K + CLIP 终选（放在 K 循环之后、这一大步的最后）=====
                     if is_last_step and final_topk > 0 and len(last_step_imgs) > 0:
