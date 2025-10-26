@@ -88,8 +88,8 @@ def import_sd():
     spec.loader.exec_module(sys.modules['diffusers'])
     from diffusers import StableDiffusionPipeline, DDIMScheduler
     sys.path.insert(0, str(sd_dir))
-    from scorers import BrightnessScorer, CompressibilityScorer, CLIPScorer, ImageRewordScorer, OneStepGenerationScorer
-    return StableDiffusionPipeline, DDIMScheduler, BrightnessScorer, CompressibilityScorer, CLIPScorer, ImageRewordScorer
+    from scorers import BrightnessScorer, CompressibilityScorer, CLIPScorer, ImageRewardScorer, OneStepGenerationScorer
+    return StableDiffusionPipeline, DDIMScheduler, BrightnessScorer, CompressibilityScorer, CLIPScorer, ImageRewardScorer, OneStepGenerationScorer
 
 # =========================
 # Scorer Factory

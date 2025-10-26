@@ -29,11 +29,12 @@ from transformers.modeling_outputs import (
     TokenClassifierOutput,
 )
 from transformers.modeling_utils import (
-    PreTrainedModel,
+    PreTrainedModel
+)
+from transformers.pytorch_utils import (
     find_pruneable_heads_and_indices,
     prune_linear_layer,
-)
-from transformers.pytorch_utils import apply_chunking_to_forward
+    apply_chunking_to_forward, )
 from transformers.utils import logging
 from transformers.models.bert.configuration_bert import BertConfig
 

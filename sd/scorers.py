@@ -10,8 +10,8 @@ import torchvision.models as models
 import torchvision.transforms as transforms
 import urllib.request
 import io
-import ImageReward.ImageReward as RM
-from difussers import ControlNetModel, StableDiffusionControlNetPipeline
+import ImageReward as RM
+from diffusers import ControlNetModel, StableDiffusionControlNetPipeline
 
 class Scorer(torch.nn.Module):
     """Base class for all scorers"""
@@ -219,9 +219,10 @@ class ImageRewardScorer(Scorer):
     def __init__(self, dtype=torch.float32):
         super().__init__(dtype)
         self.model = RM.load("ImageReward-v1.0")
-    
+
+    @torch.no_grad()  
     def __call__(self, images, prompts, timesteps):
-        return self.model.score(images, prompts)
+        return self.model.score(prompts, images)
     
 class OneStepGenerationScorer(Scorer):
     def __init__(self, dtype=torch.float32):
@@ -237,11 +238,11 @@ class OneStepGenerationScorer(Scorer):
         self.scorer_pipe.to(self.device)
         self.controlnet_condition_scale = 0
         self.model = RM.load("ImageReward-v1.0")
-
+    @torch.no_grad()
     def __call__(self, images, prompts):
 
         OneStepImage = self.run(images, prompts)
-        score = self.model.score(OneStepImage, prompts)
+        score = self.model.score(prompts, OneStepImage)
         return score
     
     def run(self,image, prompt):
