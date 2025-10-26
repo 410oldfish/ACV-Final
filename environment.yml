@@ -23,7 +23,6 @@ dependencies:
     - matplotlib
     - torchvision
     - accelerate
-    - image-reward
     - diffusers
     - clip
     - timm

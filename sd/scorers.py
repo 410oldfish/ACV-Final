@@ -10,7 +10,7 @@ import torchvision.models as models
 import torchvision.transforms as transforms
 import urllib.request
 import io
-import ImageReward as RM
+import ImageReward.ImageReward as RM
 from difussers import ControlNetModel, StableDiffusionControlNetPipeline
 
 class Scorer(torch.nn.Module):
