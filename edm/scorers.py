@@ -55,7 +55,7 @@ class BrightnessScorer(Scorer):
             
         return luminance
 
-class ImageRewordScorer(Scorer):
+class ImageRewardScorer(Scorer):
     def __init__(self, dtype=torch.float32):
         super().__init__(dtype)
         self.model = RM.load("ImageReward-v1.0")

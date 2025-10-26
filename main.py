@@ -94,7 +94,7 @@ def import_sd():
 # =========================
 # Scorer Factory
 # =========================
-def get_scorer(backend, scorer_name, BrightnessScorer, CompressibilityScorer, CLIPScorer=None, ImageNetScorer=None, ImageRewordScorer=None, OneStepGenerationScorer=None):
+def get_scorer(backend, scorer_name, BrightnessScorer, CompressibilityScorer, CLIPScorer=None, ImageNetScorer=None, ImageRewardScorer=None, OneStepGenerationScorer=None):
     """Return the appropriate scorer instance for the backend and scorer name."""
     if scorer_name == 'brightness':
         return BrightnessScorer(dtype=torch.float32)
@@ -102,8 +102,8 @@ def get_scorer(backend, scorer_name, BrightnessScorer, CompressibilityScorer, CL
         return CompressibilityScorer(dtype=torch.float32)
     elif scorer_name == 'clip' and backend == 'sd':
         return CLIPScorer(dtype=torch.float32)
-    elif scorer_name == 'imagereword' and backend == 'sd':
-        return ImageRewordScorer(dtype=torch.float32)
+    elif scorer_name == 'imagereward' and backend == 'sd':
+        return ImageRewardScorer(dtype=torch.float32)
     elif scorer_name == 'onestepgeneration' and backend == 'sd':
         return OneStepGenerationScorer(dtype=torch.float32)
     elif scorer_name == 'imagenet' and backend == 'edm':
@@ -224,8 +224,8 @@ def main():
     # SD Backend
     # -----------
     if args.backend == 'sd':
-        StableDiffusionPipeline, DDIMScheduler, BrightnessScorer, CompressibilityScorer, CLIPScorer, ImageRewordScorer, OneStepGenerationScorer= import_sd()
-        scorer = get_scorer('sd', args.scorer, BrightnessScorer, CompressibilityScorer, CLIPScorer=CLIPScorer, ImageRewordScorer=ImageRewordScorer, OneStepGenerationScorer=OneStepGenerationScorer)
+        StableDiffusionPipeline, DDIMScheduler, BrightnessScorer, CompressibilityScorer, CLIPScorer, ImageRewardScorer, OneStepGenerationScorer= import_sd()
+        scorer = get_scorer('sd', args.scorer, BrightnessScorer, CompressibilityScorer, CLIPScorer=CLIPScorer, ImageRewardScorer=ImageRewardScorer, OneStepGenerationScorer=OneStepGenerationScorer)
 
         model_id = "runwayml/stable-diffusion-v1-5"
         local_scheduler = DDIMScheduler.from_pretrained(model_id, subfolder="scheduler")
@@ -365,8 +365,8 @@ def main():
     # EDM Backend
     # -----------
     elif args.backend == 'edm':
-        dnnlib, dnnlib_util, BrightnessScorer, CompressibilityScorer, ImageNetScorer, ImageRewordScorer, OneStepGenerationScorer = import_edm()
-        scorer = get_scorer('edm', args.scorer, BrightnessScorer, CompressibilityScorer, ImageNetScorer=ImageNetScorer, ImageRewordScorer=ImageRewordScorer=None, OneStepGenerationScorer=None)
+        dnnlib, dnnlib_util, BrightnessScorer, CompressibilityScorer, ImageNetScorer, ImageRewardScorer, OneStepGenerationScorer = import_edm()
+        scorer = get_scorer('edm', args.scorer, BrightnessScorer, CompressibilityScorer, ImageNetScorer=ImageNetScorer, ImageRewardScorer=None, OneStepGenerationScorer=None)
 
         # EDM defaults
         model_root = 'https://nvlabs-fi-cdn.nvidia.com/edm/pretrained'
