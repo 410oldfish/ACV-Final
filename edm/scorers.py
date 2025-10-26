@@ -10,7 +10,7 @@ import torchvision.models as models
 import torchvision.transforms as transforms
 import urllib.request
 import io
-import ImageReword as RM
+import ImageReward as RM
 from difussers import ControlNetModel, StableDiffusionControlNetPipeline
 
 class Scorer(torch.nn.Module):
@@ -64,7 +64,6 @@ class ImageRewardScorer(Scorer):
         return self.model.score(images, prompts)
     
 class OneStepGenerationScorer(Scorer):
-    s
     def __init__(self, dtype=torch.float32):
         super().__init__(dtype)
         self.device = "cuda"

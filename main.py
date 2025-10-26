@@ -156,7 +156,7 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument('--backend', type=str, choices=['edm', 'sd'], required=True, help='Backend: edm or sd')
-    parser.add_argument('--scorer', type=str, choices=['brightness', 'compressibility', 'clip', 'imagenet'], required=True, help='Scorer name')
+    parser.add_argument('--scorer', type=str, choices=['brightness', 'compressibility', 'clip', 'imagenet', 'imagereward', 'onestepgeneration'], required=True, help='Scorer name')
     parser.add_argument('--method', type=str, default='naive', help='Sampling method (naive, rejection, beam, mcts, zero_order, eps_greedy)')
     parser.add_argument('--prompt', type=str, default='YOUR PROMPT HERE', help='Prompt for SD')
     parser.add_argument('--output', type=str, default=None, help='Output filename (default: auto)')
